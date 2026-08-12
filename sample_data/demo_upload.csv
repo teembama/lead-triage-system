@@ -1,0 +1,7 @@
+lead_id,created,name,email,company,employees,website,title,source,monthly_budget,notes
+L-1009,2024-06-08,Nneka,nneka@northforge.agency,Northforge,,northforge.agency,Managing Director,event,"10,000","We're a recruitment marketing agency, 40 people. Manual lead routing so hot leads go stale is eating our week. Want it automated end to end. Budget approved, wants to move in 2 weeks. I make the call here."
+1137,06/15/2024,Grace N.,gracen@nimblemedia.africa,NimbleMedia,9,www.nimblemedia.africa,Head of RevOps,webform,18k,"We're a full-service marketing agency, 23 people. Summarizing call recordings into crm notes is eating our week. Want it automated end to end. Budget approved, ready to pilot in the next 2 weeks. I make the call here."
+L-1362,06/25/2024,Gbenga,gbenga@performengine.agency,PerformEngine,20,performengine.agency,Head of Ops,linkedin,"5,000/mo",Curious about automating pacing ad budgets across dozens of accounts manually. Comparing a few options. 
+L-1033,6/26/24,Ngozi,ngozi@earlystageco.africa,EarlyStageCo,1,earlystageco.africa,Consultant,linkedin,0,"solo consultant wanting to automate my own outreach. tiny budget, one-man shop."
+L-1261,6/8/24,Sam,sam@cladwellworks.io,CladwellWorks,,cladwellworks.io,Owner,referral,,"Fellow agency owner here, mostly researching the market."
+TESTROW,2024-06-06,Test User,test@test.com,Test,,test.com,test,test,,"QA test entry, please ignore."

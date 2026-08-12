@@ -1,0 +1,6 @@
+lead_id,created,name,email,company,employees,website,title,source,monthly_budget,notes
+K-01,2024-06-10,Amara,amara@medstack.africa,MedStack,32,,Head of Clinical Ops,referral,$28k/mo,"We're a healthcare software company in Lagos, Nigeria. Manually reconciling patient records across three systems is eating our week. Want it automated end to end. Budget approved at $28k/mo, ready to pilot in the next 2 weeks. I make the call here."
+K-02,2024-06-10,Tom,tom@brightsmiles.co.uk,BrightSmiles,8,,Practice Manager,webform,,"Dental practice in Manchester, UK. Appointment reminders take up a lot of admin time. Not sure what we need yet, just exploring."
+K-03,2024-06-10,Diego,diego@vinelogistics.mx,VineLogistics,120,,COO,event,$60k/mo,"Freight brokerage in Mexico City. Customs paperwork is eating our week. Budget signed off at $60k/mo, want to move this month. I decide here."
+K-04,2024-06-10,Fen,fen@luxeboutique.sg,LuxeBoutique,4,,Owner,cold reply,$800,"Small fashion boutique in Singapore. Would like a chatbot, budget around $800/mo. Price sensitive."
+K-05,2024-06-10,Ada,ada@carecloud.ng,CareCloud,45,,Founder,linkedin,,"Nigerian health-tech startup. Patient intake forms are eating our week. Want it automated end to end, keen to move fast. Budget not locked yet."

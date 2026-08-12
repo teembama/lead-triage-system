@@ -1,0 +1,294 @@
+"""Stage 6 - routing and ranking.
+
+Turns a buyer status plus a score into one of four routes, and orders the
+routable leads. Every rule here comes from §8, §9 and §10 of the architecture;
+no additional routing rule is introduced.
+
+## Order of evaluation (§8/§9)
+
+The buyer gate is described in §8 as *pre-scoring*, and §9 states that
+`is_potential_buyer = false` disqualifies "overriding any score". So buyer
+status is read first and a score can never overturn it:
+
+    1. buyer == "yes" and a stated non-buying purpose -> REVIEW
+    2. a stated non-buying purpose                    -> DISQUALIFY
+    3. buyer == "no"        -> DISQUALIFY   (score never consulted)
+    4. buyer == "ambiguous" -> REVIEW       (score never consulted)
+    5. buyer == "yes":
+         a. total >= 75     -> CONTACT_NOW
+         b. otherwise       -> NURTURE
+
+Steps 1 and 2 are the exclusion gate. `non_buyer_signal` carries what the writer
+said they came here to do; anything other than "none" is a purpose that is not
+buying, and no score can outweigh it. It sits above the buyer status because it
+is the more specific statement: "I am here to benchmark your pricing" settles
+the question that `is_potential_buyer` was only estimating.
+
+Step 1 is the safeguard for the one case where the two disagree. A lead the
+model calls a buyer *and* gives a non-buying purpose is internally inconsistent,
+and inconsistency is insufficient information, not grounds for deletion - so it
+goes to a person rather than being silently discarded.
+
+## Why the score no longer disqualifies
+
+Steps 1-4 decide whether this is a prospect; step 5 decides how urgent one is.
+That division is the whole point. The score measures how strong an opportunity
+looks, and a weak opportunity is still an opportunity - "no budget yet, no
+timeline, still reading around" describes a buyer who is early, not a person who
+is not buying. Two earlier rules asked the score to answer the first question:
+a hard floor on intent, and a DISQUALIFY band below 45. Both are gone.
+
+Nothing is lost by removing the intent floor. §9 introduced it so that fit alone
+could not carry a lead to CONTACT_NOW, and that guarantee is now arithmetic
+rather than a rule: company fit is clamped at 50, so a lead under the floor tops
+out at 64 and cannot reach 75 by any combination of factors. The floor's only
+remaining effect was to delete early-stage buyers, which is the behaviour this
+routing exists to avoid. `test_the_intent_floor_is_subsumed_by_the_contact_now_line`
+holds the arithmetic in place.
+
+The consequence is deliberate and worth stating plainly: DISQUALIFY now means
+"not a prospect", and nothing else. A lead's score decides where it ranks and
+whether it is contacted today - never whether it counts as a lead at all.
+
+REVIEW is the fifth bucket for §8's "flagged for human review, not auto-resolved
+either direction". Its scores are suppressed: an ambiguous lead is not scored
+for routing, so publishing a total would invite exactly the auto-resolution §8
+forbids. The factor breakdown is kept, because the levels and evidence are what
+a human needs in order to make the call.
+
+This module computes no points. It reads the totals Stage 5 produced and
+compares them against thresholds.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Iterable, Optional
+
+from schema import NON_BUYER_SIGNALS
+
+# --------------------------------------------------------------------------- #
+# Routes and thresholds (plan §9)
+# --------------------------------------------------------------------------- #
+
+# There are exactly FOUR routing outcomes. Every lead receives exactly one of
+# them, and there is no fifth.
+CONTACT_NOW = "CONTACT_NOW"
+NURTURE = "NURTURE"
+DISQUALIFY = "DISQUALIFY"
+REVIEW = "REVIEW"
+
+ROUTES = (CONTACT_NOW, NURTURE, DISQUALIFY, REVIEW)
+
+# The three routes that carry a published score. REVIEW is excluded because its
+# scores are suppressed, not because it is a lesser kind of outcome.
+SCORED_ROUTES = (CONTACT_NOW, NURTURE, DISQUALIFY)
+
+# `total_processed` in summarise_routes() is a COUNT OF LEADS, not a route.
+# The UI shows five tiles - one running total plus the four routes - and the
+# four route counts sum to the total. Do not read the tile count as a bucket
+# count; "Total" is a metric, and no lead is ever routed to it.
+TOTAL_PROCESSED_KEY = "total_processed"
+
+CONTACT_NOW_MIN_TOTAL = 75  # §9: total >= 75. The only threshold routing reads.
+
+# Kept as documentation of two §9 rules that no longer route anything, so the
+# deviation stays visible instead of looking like an oversight.
+INTENT_FLOOR = 15
+"""§9's hard floor on intent. No longer disqualifies: the guarantee it was
+written for - that fit alone cannot reach CONTACT_NOW - is now implied by
+`MAX_COMPANY_FIT + (INTENT_FLOOR - 1) < CONTACT_NOW_MIN_TOTAL`, which a test
+asserts directly."""
+
+NURTURE_MIN_TOTAL = 45
+"""§9's NURTURE/DISQUALIFY line. No longer a routing boundary: a lead that
+clears the gates is a prospect, and a prospect is never disqualified by its
+score. Every scored lead below CONTACT_NOW_MIN_TOTAL is NURTURE."""
+
+# §10 tiebreak 2 - urgency, high > medium > low.
+URGENCY_RANK = {"high": 3, "medium": 2, "low": 1}
+
+
+# --------------------------------------------------------------------------- #
+# Routing
+# --------------------------------------------------------------------------- #
+
+def recommend(scored_lead: dict[str, Any]) -> str:
+    """Route one lead. Reads the exclusion gate and buyer status first; a score
+    never overrides either.
+
+    `scored_lead` carries the extraction's `is_potential_buyer` and
+    `non_buyer_signal` alongside the subtotals produced by Stage 5.
+    """
+    buyer = scored_lead.get("is_potential_buyer")
+    signal = scored_lead.get("non_buyer_signal") or "none"
+
+    if signal not in NON_BUYER_SIGNALS:
+        # Contract drift. Neither excluding nor promoting a lead on a value the
+        # system does not understand; the same treatment an unrecognised buyer
+        # status gets below.
+        return REVIEW
+
+    if signal != "none":
+        # The score is not read on either branch: an explicitly stated
+        # non-buying purpose is settled before scoring is relevant.
+        if buyer == "yes":
+            return REVIEW      # the two fields contradict each other
+        return DISQUALIFY
+
+    # §9: "overriding any score" - the score is not read on either branch below.
+    if buyer == "no":
+        return DISQUALIFY
+    if buyer == "ambiguous":
+        return REVIEW
+
+    if buyer != "yes":
+        # Not an architecture rule: the schema permits only yes/no/ambiguous, so
+        # anything else is a contract violation. Routing it to a human is the
+        # only option that neither discards a possible buyer nor fabricates a
+        # verdict from a value the system does not understand.
+        return REVIEW
+
+    # A prospect from here. The score sets priority, not prospect-hood: it says
+    # whether to call them today, and where they rank - never whether they count.
+    total = _score(scored_lead, "total_score")
+    return CONTACT_NOW if total >= CONTACT_NOW_MIN_TOTAL else NURTURE
+
+
+def _score(lead: dict[str, Any], key: str) -> float:
+    value = lead.get(key)
+    return float(value) if isinstance(value, (int, float)) and value == value else 0.0
+
+
+def route_lead(
+    extraction: dict[str, Any],
+    scores: dict[str, Any],
+    clean_lead: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Assemble the routed record, applying score suppression for REVIEW.
+
+    Stage 5 scores every lead, including ambiguous ones. Routing is where that
+    score is either published or withheld: a REVIEW lead's three score fields
+    are blanked so nothing downstream can rank, threshold or otherwise
+    auto-resolve it. The breakdown survives, since its levels and evidence are
+    the material a reviewer actually needs.
+    """
+    clean_lead = clean_lead or {}
+    candidate = {
+        "is_potential_buyer": extraction.get("is_potential_buyer"),
+        "non_buyer_signal": extraction.get("non_buyer_signal"),
+        "company_fit_score": scores.get("company_fit_score"),
+        "buying_intent_score": scores.get("buying_intent_score"),
+        "total_score": scores.get("total_score"),
+    }
+    route = recommend(candidate)
+    suppressed = route == REVIEW
+
+    return {
+        "lead_id": clean_lead.get("lead_id") or extraction.get("lead_id"),
+        "name": clean_lead.get("name_clean"),
+        "company": clean_lead.get("company_clean"),
+        "recommendation": route,
+        "is_potential_buyer": extraction.get("is_potential_buyer"),
+        "buyer_type": extraction.get("buyer_type"),
+        # Carried so the interface can explain an exclusion in words. The value
+        # itself is an internal token and is never shown.
+        "non_buyer_signal": extraction.get("non_buyer_signal") or "none",
+        # Blank, not zero: a suppressed score is an absent one, and a zero would
+        # sort and threshold like a real result.
+        "company_fit_score": None if suppressed else scores.get("company_fit_score"),
+        "buying_intent_score": None if suppressed else scores.get("buying_intent_score"),
+        "total_score": None if suppressed else scores.get("total_score"),
+        "scores_suppressed": suppressed,
+        "needs_human_review": suppressed,
+        "review_reason": _review_reason(extraction) if suppressed else None,
+        "disqualification_evidence": extraction.get("disqualification_evidence"),
+        "breakdown": scores.get("breakdown", {}),
+    }
+
+
+CONTRADICTION_REVIEW_REASON = (
+    "the lead gives a reason for getting in touch that is not buying, but also "
+    "reads as a genuine enquiry"
+)
+
+
+def _review_reason(extraction: dict[str, Any]) -> Optional[str]:
+    """Why a lead was held back, in the reviewer's language.
+
+    A contradiction carries no `ambiguity_reason` - the model was not ambiguous,
+    it gave two answers that cannot both be true - so it needs its own sentence
+    rather than falling through to the generic one about unsettled notes.
+    """
+    stated = extraction.get("ambiguity_reason")
+    if _nonempty(stated):
+        return stated
+    signal = extraction.get("non_buyer_signal") or "none"
+    if signal != "none" and extraction.get("is_potential_buyer") == "yes":
+        return CONTRADICTION_REVIEW_REASON
+    return stated
+
+
+def _nonempty(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def review_note(routed_lead: dict[str, Any]) -> str:
+    """The summary line for a REVIEW lead - states no total and no verdict."""
+    reason = (routed_lead.get("review_reason") or "").strip()
+    base = "Flagged for human review: the notes do not settle whether this is a buyer."
+    return f"{base} {reason[0].upper() + reason[1:]}." if reason else base
+
+
+# --------------------------------------------------------------------------- #
+# Ranking (plan §10)
+# --------------------------------------------------------------------------- #
+
+def _sort_key(lead: dict[str, Any]) -> tuple:
+    urgency = ((lead.get("breakdown") or {}).get("urgency") or {}).get("level")
+    return (
+        -_score(lead, "total_score"),                   # primary: total desc
+        -_score(lead, "buying_intent_score"),           # tiebreak 1: intent desc
+        -URGENCY_RANK.get(urgency, 0),                  # tiebreak 2: urgency desc
+        str(lead.get("lead_id") or ""),                 # stable, not an §10 rule
+    )
+
+
+def rank_leads(scored_leads: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order routable leads by §10 and stamp a 1-based `rank`.
+
+    REVIEW leads are excluded rather than ranked: §10 sorts on total score, and
+    a REVIEW lead deliberately has none. They are returned by `review_queue`
+    instead, which is what keeps them "surfaced distinctly" per §8 rather than
+    interleaved into a ranking they cannot participate in.
+
+    The final tiebreak is `lead_id`, so the ordering is total rather than
+    partial - two leads identical on all three §10 criteria still sort
+    reproducibly instead of depending on input order.
+    """
+    routable = [lead for lead in scored_leads if lead.get("recommendation") != REVIEW]
+    ordered = sorted(routable, key=_sort_key)
+    return [{**lead, "rank": index} for index, lead in enumerate(ordered, start=1)]
+
+
+def review_queue(scored_leads: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The REVIEW bucket, ordered by lead_id. Carries no rank and no score."""
+    return sorted(
+        (lead for lead in scored_leads if lead.get("recommendation") == REVIEW),
+        key=lambda lead: str(lead.get("lead_id") or ""),
+    )
+
+
+def summarise_routes(scored_leads: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """Counts for the UI metric tiles.
+
+    Returns five keys but describes FOUR routes: `total_processed` is how many
+    leads were seen, and the four route counts sum to it. `total_processed` is
+    a metric, never a destination - no lead is ever routed to "Total".
+    """
+    leads = list(scored_leads)
+    counts = {route: 0 for route in ROUTES}
+    for lead in leads:
+        route = lead.get("recommendation")
+        if route in counts:
+            counts[route] += 1
+    return {TOTAL_PROCESSED_KEY: len(leads), **counts}

@@ -1,0 +1,28 @@
+# Committed on purpose - this is configuration, not a secret.
+#
+# The theme is pinned rather than left to follow the viewer's OS. Without this,
+# a visitor whose system is set to light gets the host's light palette (near-black
+# text) while the console's own stylesheet paints a dark ground - unreadable.
+# Pinning also lets the host's own controls take the console's palette instead of
+# fighting it. These values mirror the tokens in ui.py; change both together.
+
+[theme]
+base = "dark"
+primaryColor = "#FF5A16"              # accent
+backgroundColor = "#0C0C0B"           # canvas
+secondaryBackgroundColor = "#131312"  # surface / panels
+textColor = "#F5F5F3"                 # primary text
+borderColor = "#2A2A27"               # rules
+linkColor = "#FF5A16"
+codeTextColor = "#F5F5F3"
+codeBackgroundColor = "#131312"
+dataframeBorderColor = "#2A2A27"
+dataframeHeaderBackgroundColor = "#1A1A18"
+baseRadius = "none"                   # the console is square throughout
+buttonRadius = "none"
+
+[server]
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
