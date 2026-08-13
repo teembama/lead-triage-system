@@ -47,8 +47,9 @@ def run_pipeline(
     `provider` and `cache` are injectable so tests can drive the full path
     deterministically; in the app both are left to their configured defaults.
 
-    Review leads carry no score, so they are appended after the ranked rows
-    rather than interleaved into a ranking they cannot take part in.
+    Every lead is returned in one ranked queue, ordered by route and then by
+    score within the route. Review leads take a rank like any other row; what
+    they still do not carry is a score.
     """
     clean_df, excluded_df = clean_dataframe(raw_df)
     leads = clean_df.to_dict("records")
@@ -92,13 +93,11 @@ def run_pipeline(
             record["review_reason"] = ASSESSMENT_FAILED_REVIEW_REASON
         routed.append(record)
 
-    ranked = rank_leads(routed)
-    review = [r for r in routed if r["recommendation"] == "REVIEW"]
-    for row in review:
-        row["rank"] = None
-
+    # One queue, ordered by route then score. REVIEW leads used to be appended
+    # unranked after the sorted rows; they are now ranked in place, between
+    # NURTURE and DISQUALIFY.
     return {
-        "rows": ranked + review,
+        "rows": rank_leads(routed),
         "summary": summarise_routes(routed),
         "excluded": len(excluded_df),
         "failed": sum(1 for r in results if r.status == "failed"),

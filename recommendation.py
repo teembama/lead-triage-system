@@ -107,6 +107,16 @@ score. Every scored lead below CONTACT_NOW_MIN_TOTAL is NURTURE."""
 # §10 tiebreak 2 - urgency, high > medium > low.
 URGENCY_RANK = {"high": 3, "medium": 2, "low": 1}
 
+# The order the queue is worked in. The route is the recommended action, so it
+# leads the sort and the score orders leads within each action rather than
+# across all of them - otherwise a disqualified lead with a high fit score sits
+# above a contactable one, which is not a queue anybody works top-down.
+#
+# This is a presentation decision and nothing more. `recommend()` has already
+# chosen the route by the time any of this runs; ranking reads that choice and
+# never contributes to it.
+ROUTE_PRIORITY = {CONTACT_NOW: 0, NURTURE: 1, REVIEW: 2, DISQUALIFY: 3}
+
 
 # --------------------------------------------------------------------------- #
 # Routing
@@ -244,9 +254,19 @@ def review_note(routed_lead: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 
 def _sort_key(lead: dict[str, Any]) -> tuple:
+    """Route first, then §10's criteria within it.
+
+    A REVIEW lead reaches the score positions carrying nothing - its three score
+    fields are deliberately blank - so every REVIEW lead ties there and the band
+    is ordered by the tiebreaks below it. That is intended: suppressed scores
+    stay suppressed, and ordering a band with no scores falls to urgency and
+    then lead_id, which is deterministic without inventing a total.
+    """
     urgency = ((lead.get("breakdown") or {}).get("urgency") or {}).get("level")
     return (
-        -_score(lead, "total_score"),                   # primary: total desc
+        # Primary: the recommended action, read from `recommend()`'s output.
+        ROUTE_PRIORITY.get(lead.get("recommendation"), len(ROUTE_PRIORITY)),
+        -_score(lead, "total_score"),                   # then: total desc
         -_score(lead, "buying_intent_score"),           # tiebreak 1: intent desc
         -URGENCY_RANK.get(urgency, 0),                  # tiebreak 2: urgency desc
         str(lead.get("lead_id") or ""),                 # stable, not an §10 rule
@@ -254,24 +274,33 @@ def _sort_key(lead: dict[str, Any]) -> tuple:
 
 
 def rank_leads(scored_leads: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Order routable leads by §10 and stamp a 1-based `rank`.
+    """Order every lead by route, then by §10 within the route, and stamp a
+    1-based `rank`.
 
-    REVIEW leads are excluded rather than ranked: §10 sorts on total score, and
-    a REVIEW lead deliberately has none. They are returned by `review_queue`
-    instead, which is what keeps them "surfaced distinctly" per §8 rather than
-    interleaved into a ranking they cannot participate in.
+    All four routes are ranked in one queue. REVIEW was previously excluded on
+    the grounds that §10 sorts on a total it does not have - true of the score,
+    but the route is known for every lead, so a REVIEW lead can be placed
+    without one. It sits below NURTURE and above DISQUALIFY, which is where a
+    reader looking for the next thing to do would expect to find it, and it
+    still publishes no score.
+
+    Nothing here decides anything. `recommendation` arrives already chosen and
+    is read, never written; the only field this function adds is `rank`.
 
     The final tiebreak is `lead_id`, so the ordering is total rather than
-    partial - two leads identical on all three §10 criteria still sort
+    partial - two leads identical on all the criteria above still sort
     reproducibly instead of depending on input order.
     """
-    routable = [lead for lead in scored_leads if lead.get("recommendation") != REVIEW]
-    ordered = sorted(routable, key=_sort_key)
+    ordered = sorted(scored_leads, key=_sort_key)
     return [{**lead, "rank": index} for index, lead in enumerate(ordered, start=1)]
 
 
 def review_queue(scored_leads: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The REVIEW bucket, ordered by lead_id. Carries no rank and no score."""
+    """The REVIEW bucket on its own, ordered by lead_id.
+
+    Kept for callers that want the review work in isolation. The main queue no
+    longer needs it: `rank_leads` ranks all four routes together.
+    """
     return sorted(
         (lead for lead in scored_leads if lead.get("recommendation") == REVIEW),
         key=lambda lead: str(lead.get("lead_id") or ""),

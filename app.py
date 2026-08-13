@@ -26,7 +26,7 @@ import ui
 from data_cleaning import CANONICAL_COLUMNS, read_leads_csv
 from pipeline import export_csv, run_pipeline
 from providers import ProviderConfigError
-from target_profile import TargetProfile, TargetProfileError
+from target_profile import ANY_INDUSTRY, TargetProfile, TargetProfileError
 
 st.set_page_config(page_title="Koya · Lead Triage", page_icon="◧", layout="wide")
 st.markdown(ui.stylesheet(), unsafe_allow_html=True)
@@ -76,10 +76,35 @@ if uploaded is not None:
         )
 
 SUGGESTED_INDUSTRIES = [
+    ANY_INDUSTRY,
     "Marketing & Advertising", "SaaS & Software", "Healthcare", "Financial Services",
     "E-commerce & Retail", "Professional Services", "Education", "Real Estate",
-    "Manufacturing", "Logistics & Supply Chain", "Hospitality", "Other…",
+    "Manufacturing", "Logistics & Supply Chain", "Hospitality",
 ]
+
+INDUSTRY_KEY = "target_industries"
+_PREVIOUS_INDUSTRIES = "_target_industries_previous"
+
+
+def enforce_any_exclusivity() -> None:
+    """Keep `Any` and named industries mutually exclusive, in both directions.
+
+    Which one to drop depends on which the operator just added, so the previous
+    selection is kept alongside: adding `Any` clears the named industries,
+    adding a named industry clears `Any`. Neither one resets the rest of the
+    selection, and the state ["Any", "Technology"] never survives a rerun.
+    """
+    picked = list(state.get(INDUSTRY_KEY) or [])
+    previous = list(state.get(_PREVIOUS_INDUSTRIES) or [])
+
+    if ANY_INDUSTRY in picked and len(picked) > 1:
+        picked = (
+            [name for name in picked if name != ANY_INDUSTRY]
+            if ANY_INDUSTRY in previous else [ANY_INDUSTRY]
+        )
+        state[INDUSTRY_KEY] = picked
+
+    state[_PREVIOUS_INDUSTRIES] = picked
 
 if uploaded is None:
     st.markdown(
@@ -115,13 +140,17 @@ else:
 
     col_industry, col_low, col_high, col_place = st.columns([2, 1, 1, 1.4])
     with col_industry:
-        st.markdown('<span class="k-lbl">Industry</span>', unsafe_allow_html=True)
-        choice = st.selectbox("Industry", SUGGESTED_INDUSTRIES,
-                              label_visibility="collapsed")
-        industry = (
-            st.text_input("Industry", value="", placeholder="Describe the industry",
-                          label_visibility="collapsed")
-            if choice == "Other…" else choice
+        st.markdown('<span class="k-lbl">Target industries</span>', unsafe_allow_html=True)
+        # Selections render as removable chips, and a name that is not on the
+        # list can be typed in and added - so a target can be adjusted one
+        # industry at a time instead of being rebuilt from scratch.
+        industries = st.multiselect(
+            "Target industries", SUGGESTED_INDUSTRIES,
+            default=[SUGGESTED_INDUSTRIES[1]],
+            key=INDUSTRY_KEY, on_change=enforce_any_exclusivity,
+            accept_new_options=True,
+            placeholder="Add an industry",
+            label_visibility="collapsed",
         )
     with col_low:
         st.markdown('<span class="k-lbl">Budget from</span>', unsafe_allow_html=True)
@@ -139,7 +168,7 @@ else:
 
     profile, profile_problem = None, None
     try:
-        profile = TargetProfile.create(industry, budget_min, budget_max, location)
+        profile = TargetProfile.create(industries, budget_min, budget_max, location)
     except TargetProfileError as exc:
         profile_problem = str(exc)
 

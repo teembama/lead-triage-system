@@ -405,8 +405,24 @@ def score_lead(
 
     # --- company fit ------------------------------------------------------- #
     breakdown["industry_fit"] = _level_entry(extraction, "industry_fit", INDUSTRY_FIT_POINTS)
-    if profile is not None:
-        breakdown["industry_fit"]["target_industry"] = profile.industry
+    if profile is not None and profile.accepts_any_industry:
+        # No industry criterion: every lead is treated as a match, which is the
+        # only way this factor can neither reward nor penalise anyone. It scores
+        # the table's existing match value - no new weight is introduced, and
+        # company fit still tops out at 50 - but it is a constant, so it cannot
+        # separate two leads. That is what "not a constraint" has to mean for a
+        # factor that is part of a fixed total.
+        breakdown["industry_fit"] = {
+            "level": "any",
+            "points": INDUSTRY_FIT_POINTS["high"],
+            "evidence": breakdown["industry_fit"].get("evidence") or "not specified",
+            "industry_unconstrained": True,
+        }
+    elif profile is not None:
+        # One target or several, the level came from the model and is priced by
+        # the same table. A lead matching two selected industries is a match,
+        # not a double match: nothing here adds points per industry.
+        breakdown["industry_fit"]["target_industries"] = list(profile.industries)
 
     size_resolution = resolve_measure(
         extraction, clean_lead, "employee_count_in_notes", "employees",
@@ -498,6 +514,7 @@ _PHRASES: dict[tuple[str, str], str] = {
     ("industry_fit", "medium"): "adjacent industry fit",
     ("industry_fit", "low"): "weak industry fit",
     ("industry_fit", "unknown"): "industry fit unclear",
+    ("industry_fit", "any"): "industry not a target constraint",
     ("company_size_signal", "high"): "company size in range",
     ("company_size_signal", "medium"): "company size outside the core range",
     ("company_size_signal", "low"): "company size well outside the core range",
@@ -649,9 +666,23 @@ def _ordered_factors(breakdown: dict[str, Any]) -> list[str]:
 def _phrase(factor: str, entry: dict[str, Any]) -> str:
     level = entry.get("level")
     text = _PHRASES.get((factor, level), f"{factor.replace('_', ' ')} {level}")
-    if factor == "industry_fit" and level in {"low", "medium"} and entry.get("target_industry"):
-        text = f"{text} (target profile is {entry['target_industry']})"
+    if factor == "industry_fit":
+        targets = entry.get("target_industries") or []
+        if level in {"low", "medium"} and targets:
+            text = f"{text} (target profile is {_join_industries(targets)})"
+        elif level == "high" and len(targets) > 1:
+            # Only worth saying when there was a choice to match. With one
+            # target this reads as noise, and the wording stays as it was.
+            text = f"{text} (matches {_join_industries(targets)})"
     return text
+
+
+def _join_industries(names) -> str:
+    """"A", "A or B", "A, B or C" - read aloud, not printed as a list."""
+    names = [str(name) for name in names if str(name).strip()]
+    if len(names) <= 1:
+        return names[0] if names else ""
+    return f"{', '.join(names[:-1])} or {names[-1]}"
 
 
 def _phrase_with_evidence(factor: str, entry: dict[str, Any]) -> str:

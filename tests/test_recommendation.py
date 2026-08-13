@@ -482,6 +482,125 @@ def routed(lead_id, total, intent, urgency="medium", route=NURTURE):
     }
 
 
+# --------------------------------------------------------------------------- #
+# Route priority: the queue is worked in the order of the recommended action
+# --------------------------------------------------------------------------- #
+
+def review_row(lead_id, urgency="medium"):
+    """A REVIEW lead as `route_lead` builds one: routed, and unscored."""
+    return {
+        "lead_id": lead_id, "recommendation": REVIEW,
+        "total_score": None, "buying_intent_score": None, "company_fit_score": None,
+        "scores_suppressed": True,
+        "breakdown": {"urgency": {"level": urgency, "points": 0, "evidence": "x"}},
+    }
+
+
+def test_a_weaker_contact_now_outranks_a_stronger_nurture():
+    ranked = rank_leads([routed("nu", 74, 40), routed("cn", 20, 5, route=CONTACT_NOW)])
+    assert [x["lead_id"] for x in ranked] == ["cn", "nu"]
+
+
+def test_a_nurture_lead_outranks_any_review_lead():
+    ranked = rank_leads([review_row("rv"), routed("nu", 1, 0)])
+    assert [x["lead_id"] for x in ranked] == ["nu", "rv"]
+
+
+def test_a_review_lead_outranks_any_disqualify_lead():
+    """Including a disqualified lead with a near-perfect score - the score
+    cannot promote a lead past the action it was assigned."""
+    ranked = rank_leads([routed("dq", 99, 50, route=DISQUALIFY), review_row("rv")])
+    assert [x["lead_id"] for x in ranked] == ["rv", "dq"]
+
+
+def test_the_queue_runs_contact_now_nurture_review_disqualify():
+    """The full ordering, with each route's scores chosen so that a score-first
+    sort would produce a visibly different answer."""
+    batch = [
+        routed("dq-high", 88, 44, route=DISQUALIFY),
+        review_row("rv-b"),
+        routed("nu-low", 30, 12),
+        routed("cn-high", 98, 50, route=CONTACT_NOW),
+        routed("dq-low", 12, 2, route=DISQUALIFY),
+        review_row("rv-a"),
+        routed("cn-low", 76, 30, route=CONTACT_NOW),
+        routed("nu-high", 74, 35),
+    ]
+    assert [x["lead_id"] for x in rank_leads(batch)] == [
+        "cn-high", "cn-low", "nu-high", "nu-low", "rv-a", "rv-b", "dq-high", "dq-low",
+    ]
+
+
+@pytest.mark.parametrize("route", [CONTACT_NOW, NURTURE, DISQUALIFY])
+def test_score_still_orders_leads_within_a_route(route):
+    batch = [routed("mid", 60, 30, route=route), routed("top", 90, 45, route=route),
+             routed("low", 20, 10, route=route)]
+    assert [x["lead_id"] for x in rank_leads(batch)] == ["top", "mid", "low"]
+
+
+def test_review_leads_order_deterministically_without_a_score():
+    """They tie at every score position, so the existing tiebreaks decide:
+    urgency, then lead_id. No score is invented to break the tie."""
+    batch = [review_row("z", urgency="low"), review_row("a", urgency="low"),
+             review_row("m", urgency="high")]
+    assert [x["lead_id"] for x in rank_leads(batch)] == ["m", "a", "z"]
+    assert rank_leads(batch) == rank_leads(list(reversed(batch)))
+    assert all(x["total_score"] is None for x in rank_leads(batch))
+
+
+def test_ranking_changes_nothing_but_the_rank():
+    """The guarantee that makes this a presentation change: every other field
+    survives untouched, scores and route assignments included."""
+    import copy
+
+    batch = [routed("a", 40, 20), routed("b", 90, 45, route=CONTACT_NOW),
+             routed("c", 88, 44, route=DISQUALIFY), review_row("r")]
+    before = {row["lead_id"]: copy.deepcopy(row) for row in batch}
+
+    for ranked_row in rank_leads(batch):
+        original = before[ranked_row["lead_id"]]
+        assert set(ranked_row) - set(original) == {"rank"}
+        for field, value in original.items():
+            assert ranked_row[field] == value, f"{ranked_row['lead_id']}.{field} changed"
+
+
+def test_route_priority_covers_every_route_exactly_once():
+    assert set(recommendation.ROUTE_PRIORITY) == set(recommendation.ROUTES)
+    assert sorted(recommendation.ROUTE_PRIORITY.values()) == [0, 1, 2, 3]
+    assert [route for route, _ in sorted(recommendation.ROUTE_PRIORITY.items(),
+                                         key=lambda item: item[1])] == [
+        CONTACT_NOW, NURTURE, REVIEW, DISQUALIFY]
+
+
+def test_ranking_does_not_change_what_recommend_decides():
+    """Ranking reads the route and never contributes to it: `recommend()` is
+    asserted over the whole input space it accepts."""
+    cases = [
+        (buyer, signal, intent, total)
+        for buyer in ("yes", "no", "ambiguous", "wat")
+        for signal in schema.NON_BUYER_SIGNALS
+        for intent in (0, 14, 15, 50)
+        for total in (0, 44, 45, 74, 75, 100)
+    ]
+    routes = [
+        recommend({"is_potential_buyer": buyer, "non_buyer_signal": signal,
+                   "buying_intent_score": intent, "total_score": total})
+        for buyer, signal, intent, total in cases
+    ]
+    assert len(routes) == len(cases)
+    assert set(routes) <= set(recommendation.ROUTES)
+
+    # And every one of those leads keeps the route it was given when ranked.
+    batch = [
+        {"lead_id": f"L-{i}", "recommendation": route, "total_score": total,
+         "buying_intent_score": intent, "breakdown": {}}
+        for i, (route, (_, _, intent, total)) in enumerate(zip(routes, cases))
+    ]
+    assigned = {row["lead_id"]: row["recommendation"] for row in batch}
+    after = {row["lead_id"]: row["recommendation"] for row in rank_leads(batch)}
+    assert after == assigned
+
+
 def test_primary_sort_is_total_descending():
     ranked = rank_leads([routed("a", 40, 20), routed("b", 90, 45), routed("c", 60, 30)])
     assert [x["lead_id"] for x in ranked] == ["b", "c", "a"]
@@ -513,17 +632,24 @@ def test_rank_is_one_based_and_contiguous():
     assert [x["rank"] for x in ranked] == [1, 2, 3]
 
 
-def test_review_leads_are_excluded_from_the_ranking():
-    """§10 sorts on total score; a REVIEW lead deliberately has none."""
+def test_review_leads_are_ranked_between_nurture_and_disqualify():
+    """Previously excluded from the ranking on the grounds that §10 sorts on a
+    total a REVIEW lead does not have. The route is known for every lead, so it
+    can be placed without one - and it still publishes no score."""
     batch = [
         routed("a", 90, 45),
         {"lead_id": "r", "recommendation": REVIEW, "total_score": None,
          "buying_intent_score": None, "breakdown": {}},
         routed("b", 50, 25),
+        routed("d", 88, 40, route=DISQUALIFY),
     ]
     ranked = rank_leads(batch)
-    assert [x["lead_id"] for x in ranked] == ["a", "b"]
-    assert all(x["recommendation"] != REVIEW for x in ranked)
+    assert [x["lead_id"] for x in ranked] == ["a", "b", "r", "d"]
+    assert [x["rank"] for x in ranked] == [1, 2, 3, 4]
+
+    review_row = next(x for x in ranked if x["lead_id"] == "r")
+    assert review_row["rank"] == 3
+    assert review_row["total_score"] is None      # ranked, still unscored
 
 
 def test_disqualified_leads_are_still_ranked():
@@ -690,6 +816,9 @@ def test_the_five_stage4_leads_route_as_expected():
     assert routed_unclear["recommendation"] == REVIEW
     assert routed_unclear["total_score"] is None            # suppressed
 
+    # One queue: CONTACT_NOW, then NURTURE, then the REVIEW lead last of these
+    # three - ahead of any DISQUALIFY, of which this batch has none.
     ranked = rank_leads([routed_strong, routed_weak, routed_unclear])
-    assert [x["lead_id"] for x in ranked] == ["L-1009", "L-1033"]
+    assert [x["lead_id"] for x in ranked] == ["L-1009", "L-1033", "L-1261"]
+    # The review bucket is still available on its own for callers that want it.
     assert [x["lead_id"] for x in review_queue([routed_unclear])] == ["L-1261"]

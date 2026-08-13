@@ -257,14 +257,39 @@ def build_json_schema(profile: Any = None) -> dict[str, Any]:
         },
     }
 
-    if profile is not None:
+    if profile is not None and profile.accepts_any_industry:
+        # The operator set no industry criterion, so the model is not asked to
+        # measure against one. Python scores this factor uniformly downstream;
+        # the level returned here only carries the evidence snippet.
+        industry_description = (
+            "The operator has no target industry for this run, so industry is "
+            "not a criterion. Report what the notes say the lead's business is "
+            "and use 'high' unless the notes do not say, which is 'unknown'. "
+            "Do not rank one industry above another."
+        )
+    elif profile is not None and len(profile.industries) == 1:
+        # Byte-identical to the wording used before several industries could be
+        # selected: one industry must ask exactly the question it always did.
         industry_description = (
             f"How closely the lead's own business matches the target industry: "
-            f"{profile.industry}. "
+            f"{profile.industries[0]}. "
             "high: the lead is in that industry, or a direct sub-speciality of it. "
             "medium: an adjacent or overlapping industry that plausibly has the "
             "same need. low: a clearly different industry. unknown: the notes do "
             "not say what business they are in. "
+            "Judge from what the notes actually describe - a passing mention of a "
+            "related word is not the same as being in that industry."
+        )
+    elif profile is not None:
+        industry_description = (
+            f"How closely the lead's own business matches ANY ONE of the target "
+            f"industries: {', '.join(profile.industries)}. "
+            "high: the lead is in one of those industries, or a direct "
+            "sub-speciality of one. medium: an adjacent or overlapping industry "
+            "that plausibly has the same need. low: a clearly different industry. "
+            "unknown: the notes do not say what business they are in. "
+            "Judge against the best-matching target - matching more than one is "
+            "not better than matching one, and matching none of them is 'low'. "
             "Judge from what the notes actually describe - a passing mention of a "
             "related word is not the same as being in that industry."
         )

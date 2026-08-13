@@ -369,7 +369,7 @@ def profile_summary(profile: Any) -> str:
     if profile is None:
         return ""
     cells = [
-        ("Industry", profile.industry),
+        ("Industries", profile.industry_label()),
         ("Budget", profile.budget_label()),
         ("Location", profile.location or "Any"),
     ]
@@ -797,7 +797,7 @@ def lead_report(lead: dict[str, Any], profile: Any = None) -> bytes:
             "TARGET PROFILE",
             _report_paragraph("The yardstick this lead was assessed against."),
             "",
-            _report_field("Industry", profile.industry),
+            _report_field("Industries", profile.industry_label()),
             _report_field("Budget", profile.budget_label()),
             _report_field("Location", profile.location or "Any"),
             "",
@@ -806,7 +806,9 @@ def lead_report(lead: dict[str, Any], profile: Any = None) -> bytes:
     lines.append("ASSESSMENT")
     lines.append(_report_field("Route", route))
     if suppressed:
-        lines.append(_report_field("Rank", "not ranked"))
+        # Ranked like every other row - by route, not by a score it does not
+        # have. Only the score stays withheld.
+        lines.append(_report_field("Rank", lead.get("rank")))
         lines.append(_report_field("Score", "withheld pending review"))
         lines.append("")
         reason = lead.get("review_reason") or (

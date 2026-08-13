@@ -240,11 +240,28 @@ def test_progress_callback_reports_completion():
 # Queue
 # --------------------------------------------------------------------------- #
 
-def test_queue_is_ranked_and_review_is_unranked(results):
-    ranked = [r for r in results["rows"] if r["rank"] is not None]
-    review = [r for r in results["rows"] if r["rank"] is None]
-    assert [r["rank"] for r in ranked] == list(range(1, len(ranked) + 1))
-    assert all(r["recommendation"] == "REVIEW" for r in review)
+def test_every_lead_is_ranked_including_review(results):
+    rows = results["rows"]
+    assert [r["rank"] for r in rows] == list(range(1, len(rows) + 1))
+    assert all(r["rank"] is not None for r in rows)
+    # Ranked, but a REVIEW lead still publishes no score.
+    for row in rows:
+        if row["recommendation"] == "REVIEW":
+            assert row["total_score"] is None
+            assert row["scores_suppressed"] is True
+
+
+def test_the_queue_is_ordered_by_route_then_score(results):
+    """The pipeline's own output, not just `rank_leads` in isolation."""
+    from recommendation import ROUTE_PRIORITY
+
+    rows = results["rows"]
+    priorities = [ROUTE_PRIORITY[r["recommendation"]] for r in rows]
+    assert priorities == sorted(priorities), [r["recommendation"] for r in rows]
+
+    for route in ("CONTACT_NOW", "NURTURE", "DISQUALIFY"):
+        totals = [r["total_score"] for r in rows if r["recommendation"] == route]
+        assert totals == sorted(totals, reverse=True), route
 
 
 def test_queue_table_renders_every_route_marker(results):
@@ -761,6 +778,83 @@ def test_full_user_flow_through_the_real_app():
     assert "Why this needs a person" in detail
     assert "Signals observed" in detail
     assert "researching the market" in detail
+
+
+# --------------------------------------------------------------------------- #
+# Target industries: the picker, driven through the real app script (offline)
+# --------------------------------------------------------------------------- #
+
+def _app_at_the_profile_step():
+    """app.py with a file uploaded, so section 02 is on screen. No API calls:
+    nothing is processed, only the profile controls are exercised."""
+    from streamlit.testing.v1 import AppTest
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sample = os.path.join(root, "sample_data", "demo_upload.csv")
+    if not os.path.exists(sample):
+        pytest.skip("sample_data/demo_upload.csv not present")
+
+    at = AppTest.from_file(os.path.join(root, "app.py"), default_timeout=60)
+    at.run()
+    at.file_uploader[0].set_value([("demo_upload.csv", open(sample, "rb").read(), "text/csv")])
+    at.run()
+    assert not at.exception, [str(e.value) for e in at.exception]
+    return at
+
+
+def test_the_industry_picker_offers_any_alongside_the_suggestions():
+    at = _app_at_the_profile_step()
+    options = at.multiselect[0].options
+    assert options[0] == "Any"
+    assert "Healthcare" in options
+    assert at.multiselect[0].value == ["Marketing & Advertising"]   # unchanged default
+
+
+def test_industries_can_be_added_and_removed_one_at_a_time():
+    at = _app_at_the_profile_step()
+    at.multiselect[0].set_value(["Marketing & Advertising", "Healthcare"]).run()
+    assert at.session_state["target_industries"] == ["Marketing & Advertising", "Healthcare"]
+
+    # Removing one leaves the other in place - the selection is not rebuilt.
+    at.multiselect[0].set_value(["Healthcare"]).run()
+    assert at.session_state["target_industries"] == ["Healthcare"]
+
+
+def test_choosing_any_clears_the_specific_industries():
+    at = _app_at_the_profile_step()
+    at.multiselect[0].set_value(["Marketing & Advertising", "Healthcare"]).run()
+    at.multiselect[0].set_value(["Marketing & Advertising", "Healthcare", "Any"]).run()
+    assert at.session_state["target_industries"] == ["Any"]
+
+
+def test_choosing_a_specific_industry_removes_any():
+    at = _app_at_the_profile_step()
+    at.multiselect[0].set_value(["Any"]).run()
+    assert at.session_state["target_industries"] == ["Any"]
+
+    at.multiselect[0].set_value(["Any", "Healthcare"]).run()
+    assert at.session_state["target_industries"] == ["Healthcare"]
+
+
+def test_any_and_a_specific_industry_never_coexist():
+    """Whatever order they arrive in, the state ['Any', X] does not survive."""
+    at = _app_at_the_profile_step()
+    for attempt in (["Any", "Healthcare"], ["Healthcare", "Any"],
+                    ["Any", "Healthcare", "Real Estate"]):
+        at.multiselect[0].set_value(attempt).run()
+        picked = at.session_state["target_industries"]
+        assert not ("Any" in picked and len(picked) > 1), f"{attempt} -> {picked}"
+
+
+def test_the_picker_selection_becomes_the_profile_the_run_uses():
+    """The widget is not decoration: what is picked is what gets assessed."""
+    at = _app_at_the_profile_step()
+    at.multiselect[0].set_value(["Healthcare", "Real Estate"]).run()
+
+    from target_profile import TargetProfile
+
+    built = TargetProfile.create(at.session_state["target_industries"], 5_000, 50_000)
+    assert built.industries == ("Healthcare", "Real Estate")
 
 
 # --------------------------------------------------------------------------- #

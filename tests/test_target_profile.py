@@ -29,7 +29,7 @@ from data_cleaning import CANONICAL_COLUMNS  # noqa: E402
 from llm_extraction import ExtractionCache  # noqa: E402
 from providers import ProviderResponse  # noqa: E402
 from scoring import score_lead  # noqa: E402
-from target_profile import TargetProfile, TargetProfileError  # noqa: E402
+from target_profile import ANY_INDUSTRY, TargetProfile, TargetProfileError  # noqa: E402
 
 SAAS_NG = TargetProfile.create("SaaS", 10_000, 50_000, "Nigeria")
 HEALTH_UK = TargetProfile.create("Healthcare", 50_000, 100_000, "United Kingdom")
@@ -138,7 +138,7 @@ def test_validation_messages_are_safe_to_show():
 
 def test_company_size_is_not_a_profile_criterion():
     fields = set(TargetProfile.__dataclass_fields__)
-    assert fields == {"industry", "budget_min", "budget_max", "location"}
+    assert fields == {"industries", "budget_min", "budget_max", "location"}
     assert not any("size" in f or "employee" in f or "headcount" in f for f in fields)
 
 
@@ -406,6 +406,275 @@ def test_the_profile_does_not_change_the_buyer_gate():
 
 
 # --------------------------------------------------------------------------- #
+# Several target industries at once
+# --------------------------------------------------------------------------- #
+
+BOTH = TargetProfile.create(["SaaS", "Healthcare"], 10_000, 50_000, "Nigeria")
+ANY_PROFILE = TargetProfile.create(ANY_INDUSTRY, 10_000, 50_000, "Nigeria")
+
+MATCH_POINTS = scoring.INDUSTRY_FIT_POINTS["high"]
+MISS_POINTS = scoring.INDUSTRY_FIT_POINTS["low"]
+
+
+def industry_points(profile, level="high"):
+    return score_lead(extraction(industry=level), lead(), profile)["breakdown"]["industry_fit"]
+
+
+# ---- A. one industry still behaves exactly as it did ---------------------- #
+
+def test_one_industry_as_a_string_and_as_a_list_are_the_same_profile():
+    assert TargetProfile.create("SaaS", 10_000, 50_000, "Nigeria") == SAAS_NG
+    assert TargetProfile.create(["SaaS"], 10_000, 50_000, "Nigeria") == SAAS_NG
+    assert TargetProfile.create(["SaaS"], 10_000, 50_000, "Nigeria").signature() \
+        == SAAS_NG.signature()
+
+
+def test_one_industry_asks_the_model_the_question_it_always_asked():
+    """Byte-for-byte, so a single selection cannot drift on the model's side."""
+    assert SAAS_NG.describe_for_model().splitlines()[0] == "Target industry: SaaS"
+    described = schema.build_json_schema(SAAS_NG)["properties"]["industry_fit"]["description"]
+    assert described.startswith(
+        "How closely the lead's own business matches the target industry: SaaS."
+    )
+    assert "ANY ONE" not in described
+
+
+@pytest.mark.parametrize("level,expected", [("high", 20), ("medium", 11), ("low", 3),
+                                            ("unknown", 3)])
+def test_one_industry_scores_exactly_as_before(level, expected):
+    assert industry_points(SAAS_NG, level)["points"] == expected
+
+
+# ---- B. several industries ------------------------------------------------ #
+
+def test_the_model_is_told_a_lead_need_match_only_one():
+    described = schema.build_json_schema(BOTH)["properties"]["industry_fit"]["description"]
+    assert "ANY ONE" in described
+    assert "SaaS, Healthcare" in described
+    assert "matching more than one is not better than matching one" in described
+    assert "Target industries" in BOTH.describe_for_model()
+
+
+@pytest.mark.parametrize("level,expected", [("high", 20), ("medium", 11), ("low", 3)])
+def test_several_industries_use_the_same_scoring_treatment(level, expected):
+    """Matching one of two selected industries is worth exactly what matching
+    the single selected industry is worth today."""
+    assert industry_points(BOTH, level)["points"] == expected
+    assert industry_points(BOTH, level)["points"] == industry_points(SAAS_NG, level)["points"]
+
+
+def test_a_lead_matching_neither_gets_the_existing_non_match_treatment():
+    assert industry_points(BOTH, "low")["points"] == MISS_POINTS
+
+
+# ---- C. no double counting ------------------------------------------------ #
+
+@pytest.mark.parametrize("count", [1, 2, 3, 6])
+def test_more_selected_industries_never_add_points(count):
+    names = ["SaaS", "Healthcare", "Logistics", "Retail", "Education", "Legal"][:count]
+    profile = TargetProfile.create(names, 10_000, 50_000)
+    entry = industry_points(profile, "high")
+    assert entry["points"] == MATCH_POINTS
+    assert entry["points"] <= scoring.INDUSTRY_FIT_POINTS["high"]
+
+
+def test_the_fit_subtotal_still_caps_at_fifty_with_many_industries():
+    profile = TargetProfile.create(
+        ["SaaS", "Healthcare", "Logistics", "Retail"], 10_000, 50_000, "Nigeria")
+    result = score_lead(
+        extraction(industry="high",
+                   budget=measure(True, 25_000, 25_000, "exact", "$25k"),
+                   location=place(True, "Nigeria", "Lagos")),
+        lead(), profile,
+    )
+    assert result["company_fit_score"] <= scoring.MAX_COMPANY_FIT
+    assert result["breakdown"]["industry_fit"]["points"] == MATCH_POINTS
+
+
+# ---- D. Any --------------------------------------------------------------- #
+
+def test_any_is_stored_as_no_industries_at_all():
+    assert ANY_PROFILE.industries == ()
+    assert ANY_PROFILE.accepts_any_industry is True
+    assert ANY_PROFILE.industry_label() == "Any"
+    assert SAAS_NG.accepts_any_industry is False
+
+
+@pytest.mark.parametrize("mixed", [
+    ["Any", "SaaS"], ["SaaS", "Any"], ["any", "Healthcare"], ["SaaS", "ANY", "Healthcare"],
+])
+def test_any_cannot_coexist_with_a_named_industry(mixed):
+    with pytest.raises(TargetProfileError):
+        TargetProfile.create(mixed, 10_000, 50_000)
+
+
+@pytest.mark.parametrize("empty", [[], "", None, ["", "  "]])
+def test_an_empty_selection_is_rejected_rather_than_read_as_any(empty):
+    """Choosing nothing is an unfinished form; choosing Any is a decision."""
+    with pytest.raises(TargetProfileError):
+        TargetProfile.create(empty, 10_000, 50_000)
+
+
+@pytest.mark.parametrize("level", ["high", "medium", "low", "unknown"])
+def test_any_never_penalises_a_lead_for_its_industry(level):
+    entry = industry_points(ANY_PROFILE, level)
+    assert entry["points"] == MATCH_POINTS
+    assert entry["level"] == "any"
+
+
+def test_any_cannot_separate_two_leads():
+    """The point of 'not a constraint': industry stops discriminating."""
+    scores = {
+        level: score_lead(extraction(industry=level), lead(), ANY_PROFILE)["total_score"]
+        for level in ("high", "medium", "low", "unknown")
+    }
+    assert len(set(scores.values())) == 1
+
+
+def test_any_still_respects_the_fit_ceiling():
+    result = score_lead(
+        extraction(industry="low",
+                   budget=measure(True, 25_000, 25_000, "exact", "$25k"),
+                   location=place(True, "Nigeria", "Lagos")),
+        lead(), ANY_PROFILE,
+    )
+    assert result["company_fit_score"] <= scoring.MAX_COMPANY_FIT
+
+
+def test_any_tells_the_model_not_to_rank_industries():
+    described = schema.build_json_schema(ANY_PROFILE)["properties"]["industry_fit"]["description"]
+    assert "not a criterion" in described
+    assert "Do not rank one industry above another." in described
+
+
+# ---- explanations (requirement 7) ----------------------------------------- #
+
+def test_a_match_names_the_industries_it_matched():
+    result = score_lead(
+        extraction(industry="high",
+                   **{"industry_fit": {"level": "high", "evidence": "SaaS company"}}),
+        lead(), BOTH,
+    )
+    text = scoring.generate_explanation(result["breakdown"], "CONTACT_NOW")
+    assert "matches SaaS or Healthcare" in text
+
+
+def test_a_miss_names_every_industry_it_missed():
+    result = score_lead(
+        extraction(industry="low",
+                   **{"industry_fit": {"level": "low", "evidence": "restaurant"}}),
+        lead(), BOTH,
+    )
+    text = scoring.generate_explanation(result["breakdown"], "DISQUALIFY")
+    assert "target profile is SaaS or Healthcare" in text
+
+
+def test_a_single_industry_explanation_is_worded_exactly_as_before():
+    for level, expected in (("low", True), ("high", False)):
+        result = score_lead(
+            extraction(industry=level,
+                       **{"industry_fit": {"level": level, "evidence": "restaurant"}}),
+            lead(), SAAS_NG,
+        )
+        text = scoring.generate_explanation(result["breakdown"], "NURTURE")
+        assert ("target profile is SaaS" in text) is expected
+        assert "matches SaaS" not in text          # no annotation on a lone target
+
+
+@pytest.mark.parametrize("level", ["high", "medium", "low", "unknown"])
+def test_under_any_industry_is_neither_a_strength_nor_a_drag(level):
+    """Requirement 7: the assessment must not claim industry told us anything.
+    A factor that scores the same for everyone has no business appearing as a
+    reason the lead was ranked where it was."""
+    result = score_lead(extraction(industry=level), lead(), ANY_PROFILE)
+    text = scoring.generate_explanation(result["breakdown"], "NURTURE")
+    for phrase in ("strong industry fit", "adjacent industry fit",
+                   "weak industry fit", "industry fit unclear", "target profile is"):
+        assert phrase not in text, f"{level}: explanation still argues from industry"
+
+
+def test_under_any_the_operator_sees_that_industry_was_unconstrained():
+    result = score_lead(extraction(industry="low"), lead(), ANY_PROFILE)
+    panel = ui.lead_detail({**result, "lead_id": "L-1", "recommendation": "NURTURE",
+                            "scores_suppressed": False})
+    assert ">any<" in panel                          # the factor table's level
+    assert "Any" in ui.profile_summary(ANY_PROFILE)  # the yardstick shown above it
+
+
+def test_no_internal_names_reach_the_operator():
+    for profile in (BOTH, ANY_PROFILE):
+        result = score_lead(extraction(industry="high"), lead(), profile)
+        text = scoring.generate_explanation(result["breakdown"], "NURTURE")
+        for banned in ("industries", "target_industries", "accepts_any_industry",
+                       "industry_unconstrained", "industry_fit"):
+            assert banned not in text
+        assert "_" not in text
+
+
+# ---- F. propagation into the pipeline ------------------------------------- #
+
+def test_selected_industries_reach_both_the_model_and_the_scorer():
+    seen = {}
+
+    class Spy:
+        name, model = "t", "t"
+
+        def extract(self, _system, user_message, json_schema):
+            seen["message"] = user_message
+            seen["schema"] = json_schema
+            return ProviderResponse(text=json.dumps(extraction(industry="high")))
+
+    frame = pd.DataFrame([csv_row("L-1", "A SaaS company in Lagos with a $25k budget.")]).astype(str)
+    out = pipeline.run_pipeline(frame, provider=Spy(), cache=ExtractionCache(path=None),
+                                rpm=0, profile=BOTH)
+
+    # ...into the prompt,
+    assert "SaaS" in seen["message"] and "Healthcare" in seen["message"]
+    # ...into the schema the model answers against,
+    assert "Healthcare" in seen["schema"]["properties"]["industry_fit"]["description"]
+    # ...and onto the scored breakdown the interface reads.
+    entry = out["rows"][0]["breakdown"]["industry_fit"]
+    assert entry["target_industries"] == ["SaaS", "Healthcare"]
+    assert entry["points"] == MATCH_POINTS
+
+
+def test_any_reaches_the_scorer_as_an_unconstrained_factor():
+    class Always:
+        name, model = "t", "t"
+
+        def extract(self, *_a):
+            return ProviderResponse(text=json.dumps(extraction(industry="low")))
+
+    frame = pd.DataFrame([csv_row("L-1", "A restaurant in Lagos.")]).astype(str)
+    out = pipeline.run_pipeline(frame, provider=Always(), cache=ExtractionCache(path=None),
+                                rpm=0, profile=ANY_PROFILE)
+    entry = out["rows"][0]["breakdown"]["industry_fit"]
+    assert entry["level"] == "any"
+    assert entry["points"] == MATCH_POINTS
+    assert "target_industries" not in entry
+
+
+def test_two_industry_sets_are_two_different_cache_keys():
+    keys = {
+        ExtractionCache.key(lead(), "gemini", "m", SAAS_NG),
+        ExtractionCache.key(lead(), "gemini", "m", BOTH),
+        ExtractionCache.key(lead(), "gemini", "m", ANY_PROFILE),
+    }
+    assert len(keys) == 3
+
+
+def test_the_order_industries_were_picked_in_is_not_a_different_question():
+    a = TargetProfile.create(["SaaS", "Healthcare"], 10_000, 50_000)
+    b = TargetProfile.create(["Healthcare", "SaaS"], 10_000, 50_000)
+    assert a.signature() == b.signature()
+
+
+def test_the_same_industry_picked_twice_is_one_criterion():
+    assert TargetProfile.create(["SaaS", "saas ", "SaaS"], 10_000, 50_000).industries \
+        == ("SaaS",)
+
+
+# --------------------------------------------------------------------------- #
 # Ranking: the same dataset under two profiles  (the critical test)
 # --------------------------------------------------------------------------- #
 
@@ -417,6 +686,13 @@ LEADS = [
                          "$75k/mo. Patient intake paperwork is eating our week. Want it "
                          "automated end to end within 2 weeks. I decide here."),
     csv_row("RESTAURANT", "UK restaurant, budget about $1,500. Looking at options."),
+    # Sits between the two matched leads on every profile below, and matches
+    # neither industry - so it is the hurdle a lead has to clear when its own
+    # industry is added to the target. Without something in between, a fit
+    # change can raise a score without ever being able to move a rank.
+    csv_row("MIDCO", "We're a logistics operator in London, UK. Budget signed off at "
+                     "$60k/mo. Manual dispatch paperwork is eating our week. Want it "
+                     "automated end to end within 2 weeks. I decide here."),
 ]
 
 
@@ -428,8 +704,16 @@ class ProfileAwareProvider:
 
     def extract(self, _system, user_message, _schema):
         notes = user_message.lower()
-        target_saas = "target industry: saas" in notes
-        target_health = "target industry: healthcare" in notes
+        # Read the target line the way a model would, so one industry or
+        # several is answered from the same text the real prompt carries.
+        target_line = next(
+            (line.split(":", 1)[1] for line in notes.splitlines()
+             if line.startswith("target industry:") or line.startswith("target industries")),
+            "",
+        )
+        unconstrained = "no industry preference" in target_line
+        target_saas = unconstrained or "saas" in target_line
+        target_health = unconstrained or "healthcare" in target_line
 
         if "saas company" in notes:
             industry = "high" if target_saas else "low"
@@ -437,6 +721,9 @@ class ProfileAwareProvider:
         elif "healthcare provider" in notes:
             industry = "high" if target_health else "low"
             loc, budget = ("United Kingdom", 75_000)
+        elif "logistics operator" in notes:
+            # Adjacent to everything, in neither target list.
+            industry, loc, budget = "medium", "United Kingdom", 60_000
         else:
             industry, loc, budget = "low", "United Kingdom", 1_500
 
@@ -487,6 +774,51 @@ def test_the_poor_fit_lead_stays_poor_under_both_profiles():
         assert row["recommendation"] == "NURTURE"
         assert row["total_score"] < 45
         assert row["rank"] == max(r["rank"] for r in out["rows"] if r["rank"])
+
+
+def test_adding_an_industry_to_the_target_changes_fit_and_ranking():
+    """E: the feature has to move the pipeline, not the UI state.
+
+    One profile, one dataset, one edit - add SaaS alongside Healthcare - and the
+    SaaS lead's industry fit, total and rank all move.
+    """
+    health_only = TargetProfile.create("Healthcare", 50_000, 100_000, "United Kingdom")
+    plus_saas = TargetProfile.create(["Healthcare", "SaaS"], 50_000, 100_000,
+                                     "United Kingdom")
+
+    before = {r["lead_id"]: r for r in run_under(health_only)["rows"]}
+    after = {r["lead_id"]: r for r in run_under(plus_saas)["rows"]}
+
+    saas_before = before["SAAS-NG"]
+    saas_after = after["SAAS-NG"]
+
+    # Industry fit moves from the miss tier to the match tier...
+    assert saas_before["breakdown"]["industry_fit"]["points"] == MISS_POINTS
+    assert saas_after["breakdown"]["industry_fit"]["points"] == MATCH_POINTS
+    # ...the total moves with it...
+    assert saas_after["total_score"] > saas_before["total_score"]
+    # ...and the lead climbs the queue.
+    assert saas_after["rank"] < saas_before["rank"]
+
+    # The lead that already matched is unaffected by the addition.
+    assert after["HEALTH-UK"]["breakdown"]["industry_fit"]["points"] == MATCH_POINTS
+    assert (after["HEALTH-UK"]["total_score"]
+            == before["HEALTH-UK"]["total_score"])
+
+
+def test_both_leads_match_when_both_industries_are_targeted():
+    rows = {r["lead_id"]: r for r in run_under(BOTH)["rows"]}
+    assert rows["SAAS-NG"]["breakdown"]["industry_fit"]["points"] == MATCH_POINTS
+    assert rows["HEALTH-UK"]["breakdown"]["industry_fit"]["points"] == MATCH_POINTS
+    assert rows["RESTAURANT"]["breakdown"]["industry_fit"]["points"] == MISS_POINTS
+
+
+def test_under_any_industry_stops_separating_the_dataset():
+    rows = {r["lead_id"]: r for r in run_under(ANY_PROFILE)["rows"]}
+    points = {r["breakdown"]["industry_fit"]["points"] for r in rows.values()}
+    assert points == {MATCH_POINTS}
+    # The restaurant is still last - on the factors that are still criteria.
+    assert rows["RESTAURANT"]["rank"] == max(r["rank"] for r in rows.values() if r["rank"])
 
 
 def test_the_same_profile_is_deterministic():
