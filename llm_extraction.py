@@ -20,7 +20,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import random
 import threading
 import time
@@ -46,7 +45,7 @@ from schema import build_json_schema, unknown_extraction, validate_extraction
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MAX_WORKERS = 8
+DEFAULT_MAX_WORKERS = 20
 DEFAULT_CACHE_PATH = Path(".cache") / "extractions.json"
 
 # Requests per minute the provider will accept. 15 is the Gemini free-tier
@@ -57,7 +56,12 @@ DEFAULT_RPM = 15.0
 # Observed mean call latency, used only to size the worker pool against the RPM
 # budget. Workers beyond what the quota can absorb add no throughput - they just
 # queue on the limiter.
-ASSUMED_CALL_SECONDS = 4.0
+#
+# 4.25 is measured, not guessed: 4.25s mean and 3.70s median over five serial
+# calls, the first of which carries client construction. It is deliberately the
+# mean rather than the median, because under-provisioning the pool leaves the
+# quota unspent while over-provisioning only parks a thread on the limiter.
+ASSUMED_CALL_SECONDS = 4.25
 
 # Transport failures (429, timeout, connection) get several attempts with
 # exponential backoff. Contract failures (malformed JSON, schema violation) keep
@@ -188,12 +192,20 @@ class ExtractionResult:
 
 
 def max_workers_setting(explicit: Optional[int] = None) -> int:
+    """Resolved like every other setting: environment, then secrets.toml, then
+    Streamlit's injected store.
+
+    It previously read `os.environ` alone, which made it the one setting that
+    could not be configured on a Streamlit deployment - the Secrets panel writes
+    to `st.secrets`, not to the environment, so an operator setting it there got
+    silence rather than an effect.
+    """
     if explicit:
         return max(1, explicit)
-    raw = os.environ.get("LLM_MAX_WORKERS")
+    raw = _setting("LLM_MAX_WORKERS")
     try:
         return max(1, int(raw)) if raw else DEFAULT_MAX_WORKERS
-    except ValueError:
+    except (TypeError, ValueError):
         return DEFAULT_MAX_WORKERS
 
 
@@ -465,8 +477,8 @@ def extract_batch(
                 progress_callback(completed, len(leads))
 
     # Explicit LLM_MAX_WORKERS still wins; otherwise the pool is sized to what
-    # the RPM budget can actually absorb rather than a fixed eight.
-    if max_workers is not None or os.environ.get("LLM_MAX_WORKERS"):
+    # the RPM budget can actually absorb rather than a fixed cap.
+    if max_workers is not None or _setting("LLM_MAX_WORKERS"):
         workers = max_workers_setting(max_workers)
     else:
         workers = workers_for_rpm(effective_rpm)

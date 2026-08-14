@@ -135,11 +135,105 @@ def test_rpm_is_configurable(monkeypatch):
 
 
 def test_worker_count_is_sized_to_the_budget():
-    """At 15 rpm one worker saturates the quota; eight were seven threads of 429s."""
-    assert lx.workers_for_rpm(15) == 1
-    assert lx.workers_for_rpm(60) == 4
+    """The pool is derived from the budget: enough threads to keep the quota
+    spent, and never more than the cap."""
+    assert lx.workers_for_rpm(15) == 2
+    assert lx.workers_for_rpm(60) == 5
     assert lx.workers_for_rpm(10_000) == lx.DEFAULT_MAX_WORKERS      # capped
     assert lx.workers_for_rpm(0) == lx.DEFAULT_MAX_WORKERS           # unlimited
+
+
+def test_the_worker_cap_is_twenty():
+    assert lx.DEFAULT_MAX_WORKERS == 20
+
+
+def test_the_assumed_latency_matches_what_was_measured():
+    """Sizing is only correct if this tracks reality. Measured at 4.25s mean."""
+    assert lx.ASSUMED_CALL_SECONDS == 4.25
+
+
+def test_a_tier_one_budget_is_not_capped_at_the_old_eight():
+    """The regression this change exists to prevent: the cap used to bind at 8,
+    so every RPM above ~120 bought nothing."""
+    workers = lx.workers_for_rpm(240)
+    assert workers == 17
+    assert workers > 8
+    assert workers < lx.DEFAULT_MAX_WORKERS          # derived, not clamped
+
+
+def test_the_pool_can_absorb_the_budget_it_is_given():
+    """A pool of W workers at L seconds a call sustains W/L calls per second.
+    If that is below the limiter's rate the quota goes unspent - which is the
+    bug that made LLM_RPM inert above 120."""
+    for rpm in (15, 60, 120, 240):
+        workers = lx.workers_for_rpm(rpm)
+        pool_rate = workers / lx.ASSUMED_CALL_SECONDS
+        assert pool_rate >= rpm / 60.0 - 1e-9, (
+            f"{rpm} rpm needs {rpm / 60.0:.2f} calls/s, pool sustains {pool_rate:.2f}"
+        )
+
+
+@pytest.mark.parametrize("low,high", [(15, 60), (60, 120), (120, 240)])
+def test_raising_the_budget_actually_raises_concurrency(low, high):
+    """Guards against LLM_RPM becoming a number that changes nothing."""
+    assert lx.workers_for_rpm(high) > lx.workers_for_rpm(low)
+
+
+def test_the_limiter_still_enforces_the_configured_rate():
+    """240 rpm is four calls a second. Measured through `_first_wait`, which
+    stops at the first sleep - a recording sleep that returns would spin, since
+    it never advances the clock the limiter is reading."""
+    limiter = lx.RateLimiter(rpm=240)
+    assert limiter.rate == 4.0
+    for _ in range(int(limiter.capacity)):       # drain the bucket
+        limiter.acquire(lambda _s: None)
+    assert _first_wait(limiter) == pytest.approx(0.25, abs=0.05)
+
+
+def test_the_burst_is_bounded_by_the_budget():
+    """Capacity is the burst ceiling: at 240 rpm four requests may leave
+    together, not seventeen. A pool of 17 cannot stampede the provider."""
+    limiter = lx.RateLimiter(rpm=240)
+    assert limiter.capacity == 4.0
+    assert limiter.capacity < lx.workers_for_rpm(240)
+
+
+def test_max_workers_resolves_from_secrets_not_just_the_environment(monkeypatch):
+    """The Secrets panel writes to st.secrets, never to the environment. This
+    setting used to read os.environ alone, so on a deployment it was inert."""
+    import providers
+
+    monkeypatch.delenv("LLM_MAX_WORKERS", raising=False)
+    providers._secrets_file.cache_clear()
+    monkeypatch.setattr(providers, "_secrets_file", lambda: {"LLM_MAX_WORKERS": "6"})
+    assert lx.max_workers_setting() == 6
+
+    # The environment still wins over the file, as it does for every setting.
+    monkeypatch.setenv("LLM_MAX_WORKERS", "9")
+    assert lx.max_workers_setting() == 9
+
+
+def test_a_secrets_worker_override_is_honoured_by_the_batch(monkeypatch):
+    """The override branch in extract_batch read os.environ too, so a secrets
+    value was ignored even where max_workers_setting would have honoured it."""
+    import providers
+
+    monkeypatch.delenv("LLM_MAX_WORKERS", raising=False)
+    providers._secrets_file.cache_clear()
+    monkeypatch.setattr(providers, "_secrets_file", lambda: {"LLM_MAX_WORKERS": "2"})
+
+    seen = {}
+    real_pool = lx.ThreadPoolExecutor
+
+    def spy(max_workers, *a, **kw):
+        seen["workers"] = max_workers
+        return real_pool(max_workers=max_workers, *a, **kw)
+
+    monkeypatch.setattr(lx, "ThreadPoolExecutor", spy)
+    leads = [dict(LEAD, lead_id=f"L-{i}", notes_clean=f"note {i}") for i in range(6)]
+    lx.extract_batch(leads, FakeProvider([valid_payload()] * 6), rpm=0,
+                     cache=lx.ExtractionCache(path=None), sleep=no_sleep)
+    assert seen["workers"] == 2
 
 
 def test_concurrency_is_preserved():

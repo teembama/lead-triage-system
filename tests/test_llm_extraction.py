@@ -588,13 +588,20 @@ def test_environment_overrides_the_secrets_file(monkeypatch):
 
 
 def test_max_workers_setting(monkeypatch):
-    monkeypatch.delenv("LLM_MAX_WORKERS", raising=False)
-    assert llm_extraction.max_workers_setting() == 8
-    monkeypatch.setenv("LLM_MAX_WORKERS", "3")
+    """This covers `max_workers_setting`'s own logic. Resolution order is
+    `_setting`'s job and is tested separately - stubbed here because the real
+    resolver has three sources, the last of which is Streamlit's own store,
+    and that reads whichever secrets.toml the developer happens to have."""
+    configured: dict[str, str] = {}
+    monkeypatch.setattr(llm_extraction, "_setting",
+                        lambda name, default=None: configured.get(name, default))
+
+    assert llm_extraction.max_workers_setting() == llm_extraction.DEFAULT_MAX_WORKERS
+    configured["LLM_MAX_WORKERS"] = "3"
     assert llm_extraction.max_workers_setting() == 3
-    assert llm_extraction.max_workers_setting(5) == 5
-    monkeypatch.setenv("LLM_MAX_WORKERS", "nonsense")
-    assert llm_extraction.max_workers_setting() == 8
+    assert llm_extraction.max_workers_setting(5) == 5          # explicit wins
+    configured["LLM_MAX_WORKERS"] = "nonsense"
+    assert llm_extraction.max_workers_setting() == llm_extraction.DEFAULT_MAX_WORKERS
 
 
 # --------------------------------------------------------------------------- #
