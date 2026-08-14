@@ -166,6 +166,15 @@ html, body, .stApp, .stMarkdown, [data-testid="stMarkdownContainer"] {{
 .k-sec .n{{font-family:var(--pixel);font-size:20px;color:var(--accent);line-height:1}}
 .k-sec .t{{font-family:var(--mono);font-size:13px;font-weight:600;letter-spacing:.14em;
           text-transform:uppercase;color:var(--ink)}}
+/* ---- run banner (see also results_lock_css) ---- */
+.k-runbar{{border:1px solid var(--rule-strong);border-left:2px solid var(--accent);
+          background:var(--surface-2);padding:14px 16px;margin:0 0 8px;
+          display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
+.k-runbar .k{{font-family:var(--mono);font-size:10px;letter-spacing:.12em;
+             text-transform:uppercase;color:var(--accent)}}
+.k-runbar p{{margin:0;font-family:var(--sans);font-size:13px;color:var(--ink-2) !important}}
+.k-runbar b{{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}}
+
 /* 04's header shares its row with the download, so the rule and the space above
    it are drawn by the container and suppressed on the heading itself -
    otherwise the line would stop where the heading stops, and the heading would
@@ -380,6 +389,37 @@ def profile_summary(profile: Any) -> str:
     return f'<div class="k-strip k-profile">{body}</div>'
 
 
+RESULTS_CONTAINER_KEY = "k-results"
+
+
+def results_lock_css() -> str:
+    """Style that locks the results section while a run is in flight.
+
+    Emitted only while processing, so the selector's absence is what unlocks the
+    page - there is no "unlock" rule to forget. One wrapper does the whole job
+    rather than disabling a dozen widgets individually: `pointer-events:none`
+    takes the subtree out of hit-testing, which covers the markup tables and the
+    row-click component too, neither of which has a `disabled` parameter.
+
+    Dimmed rather than hidden, because the previous run's results are still the
+    best answer available until the new run replaces them.
+    """
+    return (
+        f"<style>.st-key-{RESULTS_CONTAINER_KEY}{{"
+        "opacity:.38;pointer-events:none;user-select:none;filter:saturate(.55);"
+        "transition:opacity .18s ease,filter .18s ease}</style>"
+    )
+
+
+def run_banner(done: int, total: int) -> str:
+    """The message shown over the locked results while a run is in flight."""
+    return (
+        '<div class="k-runbar"><span class="k">Processing</span>'
+        "<p>Processing leads "
+        f"completes. <b>{done}</b> of <b>{total}</b> assessed.</p></div>"
+    )
+
+
 def masthead(status: str) -> str:
     return (
         '<div class="k-head"><div class="k-brand">'
@@ -396,7 +436,7 @@ def hero() -> str:
         "<h1>LEAD TRIAGE</h1>"
         "<p>Upload a lead export and get a ranked, explained queue. Every score traces back "
         "to a phrase in the lead&rsquo;s own words, so you can see why a lead was ranked where "
-        "it was &mdash; not just that it was.</p></div>"
+        "it was.</p></div>"
     )
 
 

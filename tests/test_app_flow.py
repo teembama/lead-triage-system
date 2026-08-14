@@ -807,7 +807,24 @@ def test_the_industry_picker_offers_any_alongside_the_suggestions():
     options = at.multiselect[0].options
     assert options[0] == "Any"
     assert "Healthcare" in options
-    assert at.multiselect[0].value == ["Marketing & Advertising"]   # unchanged default
+
+
+def test_a_fresh_session_defaults_to_any_industry():
+    """No industry restriction until the operator names one - a specific
+    default silently scored every lead against a target nobody chose."""
+    at = _app_at_the_profile_step()
+    assert at.multiselect[0].value == ["Any"]
+    assert at.session_state["target_industries"] == ["Any"]
+
+
+def test_the_default_profile_places_no_industry_constraint():
+    """The default reaches scoring as "no constraint", not as an industry."""
+    from target_profile import TargetProfile
+
+    at = _app_at_the_profile_step()
+    profile = TargetProfile.create(at.session_state["target_industries"], 5_000, 50_000)
+    assert profile.accepts_any_industry is True
+    assert profile.industries == ()
 
 
 def test_industries_can_be_added_and_removed_one_at_a_time():
@@ -829,8 +846,7 @@ def test_choosing_any_clears_the_specific_industries():
 
 def test_choosing_a_specific_industry_removes_any():
     at = _app_at_the_profile_step()
-    at.multiselect[0].set_value(["Any"]).run()
-    assert at.session_state["target_industries"] == ["Any"]
+    assert at.session_state["target_industries"] == ["Any"]     # the default
 
     at.multiselect[0].set_value(["Any", "Healthcare"]).run()
     assert at.session_state["target_industries"] == ["Healthcare"]
@@ -855,6 +871,127 @@ def test_the_picker_selection_becomes_the_profile_the_run_uses():
 
     built = TargetProfile.create(at.session_state["target_industries"], 5_000, 50_000)
     assert built.industries == ("Healthcare", "Real Estate")
+
+
+# --------------------------------------------------------------------------- #
+# Processing state: locked results, disabled start, working Cancel
+# --------------------------------------------------------------------------- #
+
+class _FakeRun:
+    """A RunHandle at a chosen point in its life, without a real thread."""
+
+    def __init__(self, done=0, total=10, finished=False):
+        self.done, self.total = done, total
+        self._finished = finished
+        self.result = None
+        self.unavailable = self.failed = False
+        self.profile = None
+
+    finished = property(lambda self: self._finished)
+    fraction = property(lambda self: self.done / self.total if self.total else 0.0)
+
+
+def _app_mid_run(results, done=3, total=10, **kw):
+    """A file uploaded (so section 02 and its controls exist) and a run active."""
+    at = _app_at_the_profile_step()
+    at.session_state["results"] = results
+    at.session_state["run"] = _FakeRun(done=done, total=total, **kw)
+    at.run()
+    return at
+
+
+def _app_idle_with_results(results):
+    """The same page with no run in flight - the harvested, unlocked state."""
+    at = _app_at_the_profile_step()
+    at.session_state["results"] = results
+    at.run()
+    return at
+
+
+LOCK_MARKER = "st-key-k-results{"      # emitted only while locked
+
+
+def test_the_start_button_is_disabled_while_a_run_is_active(results):
+    at = _app_mid_run(results)
+    process = next(b for b in at.button if b.label == "Process leads")
+    assert process.disabled is True
+
+
+def test_a_run_in_flight_offers_no_stop_control(results):
+    """Cancellation was removed: a run started is a run completed, and no
+    control on the page claims otherwise."""
+    at = _app_mid_run(results)
+    labels = [b.label.lower() for b in at.button]
+    assert not [label for label in labels if "cancel" in label or "stop" in label]
+
+
+def test_the_results_section_is_locked_while_processing(results):
+    at = _app_mid_run(results)
+    rendered = " ".join(m.value for m in at.markdown)
+    assert LOCK_MARKER in rendered, "no lock styling emitted"
+    assert "pointer-events:none" in rendered
+
+    # ...and the controls inside it are disabled too, so keyboard focus cannot
+    # reach what the pointer cannot.
+    assert all(sb.disabled for sb in at.selectbox if sb.label in ("Route", "Open lead"))
+    assert all(d.disabled for d in at.download_button)
+
+
+@pytest.mark.parametrize("stage", ["idle", "running"])
+def test_the_page_renders_each_section_exactly_once(results, stage):
+    """One 03 // QUEUE, in order, whether or not a run is in flight."""
+    import re
+
+    at = _app_idle_with_results(results) if stage == "idle" else _app_mid_run(results)
+    headers = []
+    for block in at.markdown:
+        headers += re.findall(
+            r'<span class="n">(\d+)</span><span class="t">// ([^<]+)', block.value
+        )
+    numbers = [n for n, _ in headers]
+    assert numbers == ["01", "02", "03", "04"], headers
+    assert numbers.count("03") == 1
+
+
+def test_the_results_stay_visible_while_processing(results):
+    """Locked, not removed - the previous answer is still the best one until
+    the new run replaces it."""
+    at = _app_mid_run(results)
+    rendered = " ".join(m.value for m in at.markdown)
+    assert "k-table" in rendered, "the queue disappeared during processing"
+    assert "L-1009" in rendered
+    assert "Processing leads" in rendered
+    assert "temporarily locked" in rendered
+
+
+def test_the_banner_reports_actual_progress(results):
+    at = _app_mid_run(results, done=137, total=509)
+    rendered = " ".join(m.value for m in at.markdown)
+    assert "137" in rendered and "509" in rendered
+
+
+def test_completion_unlocks_the_interface(results):
+    """Once harvested there is no handle, so nothing is dimmed or disabled."""
+    at = _app_idle_with_results(results)     # run is None: the harvested state
+    rendered = " ".join(m.value for m in at.markdown)
+    assert LOCK_MARKER not in rendered
+    assert not [b for b in at.button if "Cancel" in b.label]
+    assert next(b for b in at.button if b.label == "Process leads").disabled is False
+    assert all(not sb.disabled for sb in at.selectbox if sb.label in ("Route", "Open lead"))
+    assert all(not d.disabled for d in at.download_button)
+
+
+def test_a_first_run_with_no_previous_results_still_shows_progress():
+    """Nothing to dim underneath, and nothing invented to fill the space."""
+    at = _app_at_the_profile_step()
+    at.session_state["run"] = _FakeRun(done=2, total=20)
+    at.run()
+    rendered = " ".join(m.value for m in at.markdown)
+    assert "Processing leads" in rendered
+    # `<table class="k-table">` only appears when a queue is actually drawn;
+    # the bare class name is in the stylesheet on every page.
+    assert '<table class="k-table">' not in rendered, "invented a queue"
+    assert not at.exception
 
 
 # --------------------------------------------------------------------------- #
@@ -883,10 +1020,17 @@ def _click_row(at, lead_id):
     The click arrives as a trigger value on the component's event channel;
     AppTest has no helper for that, so the widget state is assembled by hand and
     the script is rerun with it - the same path a real click takes.
+
+    The trigger id is derived from the component's own widget key rather than
+    searched for in session state: Streamlit only lists the event channel there
+    once a value has been delivered on it, so discovery works on the second
+    click and not the first.
     """
-    trigger_id = next(
-        key for key in at.session_state._state._new_widget_state if key.endswith("__events")
+    base = next(
+        key for key in at.session_state._state._new_widget_state
+        if key.endswith("queue_rows")
     )
+    trigger_id = f"$$STREAMLIT_INTERNAL_KEY_{base}__events"
     states = at._tree.get_widget_states()
     widget = states.widgets.add()
     widget.id = trigger_id

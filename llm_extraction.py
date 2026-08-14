@@ -57,11 +57,19 @@ DEFAULT_RPM = 15.0
 # budget. Workers beyond what the quota can absorb add no throughput - they just
 # queue on the limiter.
 #
-# 4.25 is measured, not guessed: 4.25s mean and 3.70s median over five serial
-# calls, the first of which carries client construction. It is deliberately the
-# mean rather than the median, because under-provisioning the pool leaves the
-# quota unspent while over-provisioning only parks a thread on the limiter.
-ASSUMED_CALL_SECONDS = 4.25
+# 3.05 is the median call latency measured across ~900 live calls in a
+# concurrency sweep (1, 8, 12, 17 and 20 workers against 100 leads). Latency is
+# flat with respect to concurrency - median 2.99-3.33s at every level - so one
+# constant is honest here.
+#
+# It replaces 4.25, which came from five serial calls whose first carried client
+# construction and skewed the mean. That over-provisioned the pool: at 240 rpm it
+# derived 17 workers, which measured only ~7% more throughput than 12 while
+# spending ~104s per run blocked on the limiter, against ~13s at 12.
+#
+# The median rather than the mean, because the mean is dragged by a thin tail
+# (p95 ~5.2s) that describes stragglers rather than the rate the pool sustains.
+ASSUMED_CALL_SECONDS = 3.05
 
 # Transport failures (429, timeout, connection) get several attempts with
 # exponential backoff. Contract failures (malformed JSON, schema violation) keep
@@ -471,6 +479,7 @@ def extract_batch(
         nonlocal completed
         results[index] = extract_signals(leads[index], provider, cache=cache,
                                          limiter=limiter, profile=profile, sleep=sleep)
+        # Advanced only once the lead has actually finished, never on submission.
         with lock:
             completed += 1
             if progress_callback:
@@ -489,7 +498,16 @@ def extract_batch(
         list(pool.map(run, range(len(leads))))
 
     cache.save()
-    return [r for r in results if r is not None]
+
+    # Index-aligned with `leads`, always, and never filtered. This is
+    # load-bearing: callers pair the two lists positionally, so dropping an
+    # entry would silently attach one lead's extraction to a different lead.
+    # `extract_signals` never raises, so a gap here means a worker died - which
+    # is worth failing loudly for rather than papering over by shifting rows up.
+    missing = [index for index, result in enumerate(results) if result is None]
+    if missing:
+        raise RuntimeError(f"extraction produced no result for lead index {missing[0]}")
+    return [result for result in results if result is not None]
 
 
 def summarise_batch(results: list[ExtractionResult]) -> dict[str, Any]:

@@ -18,14 +18,12 @@ or route is decided here.
 
 from __future__ import annotations
 
-import traceback
-
 import streamlit as st
 
+import background
 import ui
 from data_cleaning import CANONICAL_COLUMNS, read_leads_csv
-from pipeline import export_csv, run_pipeline
-from providers import ProviderConfigError
+from pipeline import export_csv
 from target_profile import ANY_INDUSTRY, TargetProfile, TargetProfileError
 
 st.set_page_config(page_title="Koya · Lead Triage", page_icon="◧", layout="wide")
@@ -39,8 +37,55 @@ state = st.session_state
 state.setdefault("results", None)
 state.setdefault("selected", None)
 state.setdefault("profile", None)
+state.setdefault("run", None)          # a RunHandle while a run is in flight
 
 results = state["results"]
+
+# A run is "active" from the moment it starts until the script harvests it. The
+# whole interface below reads this one flag: it disables the start control,
+# reveals Cancel, and locks the results section.
+state.setdefault("run_error", None)
+
+run = state["run"]
+processing = run is not None and not run.finished
+
+
+@st.fragment(run_every="0.5s")
+def _render_run_state() -> None:
+    """Poll the background run and draw its progress.
+
+    A fragment because it must repaint on a timer without re-running the whole
+    script: the results section below is expensive to rebuild and would flicker
+    twice a second. When the run ends this promotes the outcome into session
+    state and reruns the *app*, which is what unlocks the rest of the page.
+
+    Everything here executes on the script thread, so it may call `st.*` freely.
+    The worker only ever wrote integers into the handle.
+    """
+    handle = state.get("run")
+    if handle is None:
+        return
+
+    if not handle.finished:
+        st.markdown(ui.run_banner(handle.done, handle.total), unsafe_allow_html=True)
+        st.progress(
+            handle.fraction,
+            text=f"Processing leads… {handle.done} / {handle.total}",
+        )
+        return
+
+    # Finished, cleanly or otherwise. Harvest and hand the page back.
+    state["run"] = None
+    state["run_error"] = None
+    if handle.result is not None:
+        state["results"] = handle.result
+        state["profile"] = handle.profile
+        state["selected"] = None
+    elif handle.unavailable:
+        state["run_error"] = "unavailable"
+    elif handle.failed:
+        state["run_error"] = "failed"
+    st.rerun()
 
 # ---- masthead & hero ------------------------------------------------------ #
 
@@ -84,6 +129,16 @@ SUGGESTED_INDUSTRIES = [
 
 INDUSTRY_KEY = "target_industries"
 _PREVIOUS_INDUSTRIES = "_target_industries_previous"
+
+# No industry restriction until the operator names one.
+DEFAULT_INDUSTRIES = [ANY_INDUSTRY]
+
+# Seeded to match the widget's own default, because the tracker below is only
+# written by the on-change callback. Left unset, the very first change would be
+# compared against an empty selection - and adding an industry alongside the
+# default `Any` would look like `Any` was the new arrival and drop the industry
+# instead.
+state.setdefault(_PREVIOUS_INDUSTRIES, list(DEFAULT_INDUSTRIES))
 
 
 def enforce_any_exclusivity() -> None:
@@ -146,7 +201,7 @@ else:
         # industry at a time instead of being rebuilt from scratch.
         industries = st.multiselect(
             "Target industries", SUGGESTED_INDUSTRIES,
-            default=[SUGGESTED_INDUSTRIES[1]],
+            default=DEFAULT_INDUSTRIES,
             key=INDUSTRY_KEY, on_change=enforce_any_exclusivity,
             accept_new_options=True,
             placeholder="Add an industry",
@@ -181,149 +236,152 @@ else:
 
     col_a, col_b = st.columns([1, 2])
     with col_a:
-        partial = st.checkbox("Process a sample only", value=False)
+        partial = st.checkbox("Process a sample only", value=False,
+                              disabled=processing)
     with col_b:
         sample_size = (
             st.number_input(
                 "Leads to process", min_value=1, max_value=max(1, len(raw_df)),
                 value=min(20, len(raw_df)), label_visibility="collapsed",
+                disabled=processing,
             )
             if partial else None
         )
 
-    if st.button("Process leads", type="primary", disabled=profile is None):
-        bar = st.progress(0.0, text="Reading leads…")
+    start = st.button("Process leads", type="primary",
+                      disabled=profile is None or processing, width="content")
 
-        def tick(done: int, total: int) -> None:
-            # Called from worker threads, which have no script context of their
-            # own. Progress display is cosmetic and must never be able to abort
-            # a run that is otherwise succeeding.
-            try:
-                bar.progress(done / total, text=f"Assessing leads… {done} of {total}")
-            except Exception:  # noqa: BLE001
-                pass
+    if start:
+        # Returns immediately. The pipeline runs on its own thread so this
+        # script can finish, repaint, and keep Cancel operable.
+        planned = min(sample_size, len(raw_df)) if partial else len(raw_df)
+        state["run"] = background.start_run(
+            raw_df, profile=profile,
+            limit=sample_size if partial else None, total=planned,
+        )
+        st.rerun()
 
-        try:
-            state["results"] = run_pipeline(
-                raw_df, limit=sample_size if partial else None, progress=tick,
-                profile=profile,
-            )
-            state["profile"] = profile
-            state["selected"] = None
-            bar.empty()
-            st.rerun()
-        except ProviderConfigError:
-            bar.empty()
-            st.markdown(
-                '<div class="k-err"><span class="k">Assessment unavailable</span>'
-                "<p>Lead assessment is not available for this deployment, so leads cannot be "
-                "scored right now. Your file was read and validated successfully.</p></div>",
-                unsafe_allow_html=True,
-            )
-        except Exception:  # noqa: BLE001 - surface it, never blank the page
-            bar.empty()
-            # The exception text stays in the server log. It was previously
-            # rendered, which put raw Python at the user - a stale-module reload
-            # once showed them "run_pipeline() got an unexpected keyword
-            # argument 'profile'". Function names and signatures are no more
-            # appropriate on screen than a provider's 429 body.
-            traceback.print_exc()
-            st.markdown(
-                '<div class="k-err"><span class="k">Processing stopped</span>'
-                "<p>Something went wrong while assessing these leads, so the run "
-                "was stopped. Nothing was changed in your file.</p>"
-                "<p>Try again, or process a smaller sample to narrow it down.</p>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
+    if state["run"] is not None:
+        _render_run_state()
 
-if not results:
-    st.stop()
-
-
-# ---- 03 // QUEUE ---------------------------------------------------------- #
-
-st.markdown(ui.section("03", "Queue"), unsafe_allow_html=True)
-st.markdown(ui.profile_summary(state.get("profile")), unsafe_allow_html=True)
-st.markdown(ui.metric_tiles(results["summary"]), unsafe_allow_html=True)
-
-footnotes = []
-if results["excluded"]:
-    footnotes.append(f'{results["excluded"]} row(s) set aside as incomplete or not a lead')
-if results["failed"]:
-    footnotes.append(f'{results["failed"]} lead(s) could not be assessed and need a look')
-if footnotes:
-    st.markdown(
-        f'<p class="k-meta" style="margin-top:12px">{ui._e(" · ".join(footnotes))}</p>',
-        unsafe_allow_html=True,
-    )
-
-
-rows = results["rows"]
-route_choices = ["All routes"] + [
-    r for r in ("CONTACT_NOW", "NURTURE", "DISQUALIFY", "REVIEW") if results["summary"].get(r)
-]
-
-col_filter, col_open = st.columns([1, 2])
-with col_filter:
-    route_filter = st.selectbox("Route", route_choices, label_visibility="collapsed")
-
-visible = rows if route_filter == "All routes" else [
-    r for r in rows if r["recommendation"] == route_filter
-]
-
-labels = {f'{r["company"] or r["lead_id"]} · {r["lead_id"]}': r["lead_id"] for r in visible}
-with col_open:
-    picked = st.selectbox("Open lead", ["Open a lead…"] + list(labels),
-                          label_visibility="collapsed")
-# Only act on a *change* here. The rows below are selectable too, and a
-# selectbox that re-asserted its value on every rerun would drag the selection
-# back off whichever row was just clicked.
-if picked in labels and picked != state.get("picked_label"):
-    state["selected"] = labels[picked]
-state["picked_label"] = picked
-
-# Mounted before the table so a click is applied to the same run that draws it:
-# the clicked row is highlighted and its detail opens without a second pass.
-clicked = queue_row_clicks(key="queue_rows", on_lead_change=lambda: None).lead
-if clicked:
-    state["selected"] = clicked
-
-st.markdown(ui.queue_table(visible, state["selected"]), unsafe_allow_html=True)
-
-st.download_button(
-    "Download results (CSV)", data=export_csv(rows),
-    file_name="lead_triage_results.csv", mime="text/csv",
-)
-
-
-# ---- 04 // LEAD DETAIL ---------------------------------------------------- #
-
-selected = next((r for r in rows if str(r["lead_id"]) == str(state["selected"])), None)
-
-# One flex row: heading hard left, download hard right, both on the same line.
-# Columns put each side in its own block and left the button sitting off the
-# heading's line; a single horizontal container is one row by construction. The
-# rule and the space above it belong to the container, so the line still runs
-# the full width of the section rather than stopping at the heading.
-with st.container(key="k-detail-head", horizontal=True,
-                  horizontal_alignment="distribute", vertical_alignment="center"):
-    st.markdown(ui.section("04", "Lead detail"), unsafe_allow_html=True, width="content")
-    if selected is not None:
-        st.download_button(
-            "Download detail",
-            data=ui.lead_report(selected, state.get("profile")),
-            file_name=ui.report_filename(selected),
-            mime="text/plain",
-            width="content",
+    if state["run_error"] == "unavailable":
+        st.markdown(
+            '<div class="k-err"><span class="k">Assessment unavailable</span>'
+            "<p>Lead assessment is not available for this deployment, so leads cannot be "
+            "scored right now. Your file was read and validated successfully.</p></div>",
+            unsafe_allow_html=True,
+        )
+    elif state["run_error"] == "failed":
+        # The exception text stays in the server log. Function names and
+        # signatures are no more appropriate on screen than a 429 body.
+        st.markdown(
+            '<div class="k-err"><span class="k">Processing stopped</span>'
+            "<p>Something went wrong while assessing these leads, so the run "
+            "was stopped. Nothing was changed in your file.</p>"
+            "<p>Try again, or process a smaller sample to narrow it down.</p>"
+            "</div>",
+            unsafe_allow_html=True,
         )
 
-if selected is None:
-    st.markdown(
-        '<div class="k-state empty"><h4>NO LEAD SELECTED</h4>'
-        "<p>Open a lead from the queue above to see its full assessment.</p></div>",
-        unsafe_allow_html=True,
-    )
+if not results:
+    # Nothing assessed yet. A first run has no previous queue to dim, so the
+    # progress panel above stands alone rather than over an invented one.
     st.stop()
 
-st.markdown(ui.lead_detail(selected), unsafe_allow_html=True)
+# Everything below is the results section, and all of it locks together while a
+# run is in flight. One wrapper rather than a `disabled=` on each control: the
+# stylesheet takes the whole subtree out of hit-testing, which covers the custom
+# row-click component and the markup tables too - neither of which has a
+# `disabled` parameter to set.
+if processing:
+    st.markdown(ui.results_lock_css(), unsafe_allow_html=True)
+
+with st.container(key=ui.RESULTS_CONTAINER_KEY):
+
+    # ---- 03 // QUEUE ------------------------------------------------------ #
+
+    st.markdown(ui.section("03", "Queue"), unsafe_allow_html=True)
+    st.markdown(ui.profile_summary(state.get("profile")), unsafe_allow_html=True)
+    st.markdown(ui.metric_tiles(results["summary"]), unsafe_allow_html=True)
+
+    footnotes = []
+    if results["excluded"]:
+        footnotes.append(f'{results["excluded"]} row(s) set aside as incomplete or not a lead')
+    if results["failed"]:
+        footnotes.append(f'{results["failed"]} lead(s) could not be assessed and need a look')
+    if footnotes:
+        st.markdown(
+            f'<p class="k-meta" style="margin-top:12px">{ui._e(" · ".join(footnotes))}</p>',
+            unsafe_allow_html=True,
+        )
+
+    rows = results["rows"]
+    route_choices = ["All routes"] + [
+        r for r in ("CONTACT_NOW", "NURTURE", "DISQUALIFY", "REVIEW")
+        if results["summary"].get(r)
+    ]
+
+    col_filter, col_open = st.columns([1, 2])
+    with col_filter:
+        route_filter = st.selectbox("Route", route_choices, label_visibility="collapsed",
+                                    disabled=processing)
+
+    visible = rows if route_filter == "All routes" else [
+        r for r in rows if r["recommendation"] == route_filter
+    ]
+
+    labels = {f'{r["company"] or r["lead_id"]} · {r["lead_id"]}': r["lead_id"] for r in visible}
+    with col_open:
+        picked = st.selectbox("Open lead", ["Open a lead…"] + list(labels),
+                              label_visibility="collapsed", disabled=processing)
+    # Only act on a *change* here. The rows below are selectable too, and a
+    # selectbox that re-asserted its value on every rerun would drag the selection
+    # back off whichever row was just clicked.
+    if picked in labels and picked != state.get("picked_label"):
+        state["selected"] = labels[picked]
+    state["picked_label"] = picked
+
+    # Mounted before the table so a click is applied to the same run that draws it:
+    # the clicked row is highlighted and its detail opens without a second pass.
+    clicked = queue_row_clicks(key="queue_rows", on_lead_change=lambda: None).lead
+    if clicked and not processing:
+        state["selected"] = clicked
+
+    st.markdown(ui.queue_table(visible, state["selected"]), unsafe_allow_html=True)
+
+    st.download_button(
+        "Download results (CSV)", data=export_csv(rows),
+        file_name="lead_triage_results.csv", mime="text/csv",
+        disabled=processing,
+    )
+
+    # ---- 04 // LEAD DETAIL ------------------------------------------------ #
+
+    selected = next((r for r in rows if str(r["lead_id"]) == str(state["selected"])), None)
+
+    # One flex row: heading hard left, download hard right, both on the same line.
+    # Columns put each side in its own block and left the button sitting off the
+    # heading's line; a single horizontal container is one row by construction. The
+    # rule and the space above it belong to the container, so the line still runs
+    # the full width of the section rather than stopping at the heading.
+    with st.container(key="k-detail-head", horizontal=True,
+                      horizontal_alignment="distribute", vertical_alignment="center"):
+        st.markdown(ui.section("04", "Lead detail"), unsafe_allow_html=True, width="content")
+        if selected is not None:
+            st.download_button(
+                "Download detail",
+                data=ui.lead_report(selected, state.get("profile")),
+                file_name=ui.report_filename(selected),
+                mime="text/plain",
+                width="content",
+                disabled=processing,
+            )
+
+    if selected is None:
+        st.markdown(
+            '<div class="k-state empty"><h4>NO LEAD SELECTED</h4>'
+            "<p>Open a lead from the queue above to see its full assessment.</p></div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(ui.lead_detail(selected), unsafe_allow_html=True)

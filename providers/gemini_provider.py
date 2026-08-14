@@ -23,6 +23,7 @@ simplification here.
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any, Optional
 
 from providers import (
@@ -113,13 +114,30 @@ class GeminiProvider:
         self.model = model or _setting("GEMINI_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL
         self._api_key = api_key or _setting("GEMINI_API_KEY") or _setting("GOOGLE_API_KEY")
         self._client = None
+        self._client_lock = threading.Lock()
 
     # -- client ------------------------------------------------------------- #
 
     @property
     def client(self):
+        """One client per provider, built once however many threads ask at once.
+
+        The lock is not decoration. Every worker in a run reaches this property
+        at the same moment, and an unsynchronised `if None: build` let all of
+        them through: each built a client, each assigned, and the last write
+        won. The losers were then unreferenced, so the garbage collector ran
+        `genai.Client.__del__` -> `close()` on them - closing the transport
+        underneath whichever worker was still mid-request on one, which surfaced
+        as "Cannot send a request, as the client has been closed." and cost a
+        wasted retry per affected lead.
+
+        Double-checked so the cost is paid once: after the first construction
+        the outer test short-circuits and no thread takes the lock again.
+        """
         if self._client is None:
-            self._client = self._build_client()
+            with self._client_lock:
+                if self._client is None:
+                    self._client = self._build_client()
         return self._client
 
     def _build_client(self):

@@ -50,6 +50,9 @@ def run_pipeline(
     Every lead is returned in one ranked queue, ordered by route and then by
     score within the route. Review leads take a rank like any other row; what
     they still do not carry is a score.
+
+    A run assesses every lead it is given: there is no partial outcome, so
+    `summary["total_processed"]` is always the number of scoreable leads found.
     """
     clean_df, excluded_df = clean_dataframe(raw_df)
     leads = clean_df.to_dict("records")
@@ -63,6 +66,14 @@ def run_pipeline(
     extra = {"sleep": sleep} if sleep is not None else {}
     results = extract_batch(leads, provider, cache=cache, rpm=rpm, profile=profile,
                             progress_callback=progress, **extra)
+
+    # `extract_batch` guarantees one result per lead, in order, so this pairing
+    # is safe. Asserted rather than assumed: a regression here would attach an
+    # extraction to the wrong lead without anything visibly breaking.
+    if len(results) != len(leads):
+        raise RuntimeError(
+            "extraction returned %d results for %d leads" % (len(results), len(leads))
+        )
 
     routed: list[dict[str, Any]] = []
     for lead, result in zip(leads, results):

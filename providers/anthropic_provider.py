@@ -12,6 +12,7 @@ why only the Gemini provider carries a schema adapter.
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Optional
 
 from providers import (
@@ -47,11 +48,23 @@ class AnthropicProvider:
         self._max_retries = max_retries
         self._api_key = api_key or _setting("ANTHROPIC_API_KEY")
         self._client = None
+        self._client_lock = threading.Lock()
 
     @property
     def client(self):
+        """One client per provider, built once however many threads ask at once.
+
+        Same double-checked construction as the Gemini provider, for the same
+        reason: an unsynchronised lazy init let every worker build its own
+        client, and the orphaned ones were closed by the garbage collector
+        while other threads were still using them. This backend is not the
+        active one, but it carried the identical defect and would have shown
+        the identical symptom the moment it was selected.
+        """
         if self._client is None:
-            self._client = self._build_client()
+            with self._client_lock:
+                if self._client is None:
+                    self._client = self._build_client()
         return self._client
 
     def _build_client(self):
