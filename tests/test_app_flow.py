@@ -960,8 +960,14 @@ def test_the_results_stay_visible_while_processing(results):
     rendered = " ".join(m.value for m in at.markdown)
     assert "k-table" in rendered, "the queue disappeared during processing"
     assert "L-1009" in rendered
-    assert "Processing leads" in rendered
-    assert "temporarily locked" in rendered
+    # Processing is announced...
+    assert "Processing" in rendered
+    assert ui.run_banner(3, 10) in rendered, "the run banner is not on screen"
+    # ...and the results are genuinely locked, asserted against the mechanism
+    # rather than the copy, so a reworded banner cannot make this pass while
+    # the section stays interactive.
+    assert LOCK_MARKER in rendered, "results were not locked"
+    assert "pointer-events:none" in rendered
 
 
 def test_the_banner_reports_actual_progress(results):

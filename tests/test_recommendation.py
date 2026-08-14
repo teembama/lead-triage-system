@@ -99,27 +99,104 @@ def test_an_ambiguous_lead_with_a_stated_purpose_is_excluded_not_reviewed():
                           non_buyer_signal="media_enquiry")) == DISQUALIFY
 
 
+def _with_levels(record, **levels):
+    """Attach extracted levels the way `route_lead` passes them to `recommend`."""
+    record["breakdown"] = {
+        factor: {"level": level, "points": 0, "evidence": "x"}
+        for factor, level in levels.items()
+    }
+    return record
+
+
 @pytest.mark.parametrize("signal", EXCLUDING_SIGNALS)
-def test_a_buyer_with_a_stated_non_buying_purpose_goes_to_a_human(signal):
-    """The two fields contradict each other. Discarding the lead on one of them
-    would be a guess; a person decides instead."""
-    assert recommend(lead("yes", fit=50, intent=50, total=100,
-                          non_buyer_signal=signal)) == REVIEW
-    assert recommend(lead("yes", fit=1, intent=1, total=2,
-                          non_buyer_signal=signal)) == REVIEW
+def test_a_stated_non_buying_purpose_disqualifies_a_supposed_buyer(signal):
+    """Being labelled a buyer is not evidence of buying. Without notes stating
+    a purchase under way, the stated non-buying purpose stands - otherwise a
+    competitor escaped exclusion whenever the extraction happened to say
+    `yes`, which is the defect this rule exists to close."""
+    for fit, intent, total in ((50, 50, 100), (1, 1, 2)):
+        record = _with_levels(
+            lead("yes", fit=fit, intent=intent, total=total, non_buyer_signal=signal),
+            purchasing_readiness="unknown", buying_stage="exploring",
+        )
+        assert recommend(record) == DISQUALIFY
 
 
-def test_a_contradiction_suppresses_the_score_like_any_review():
+@pytest.mark.parametrize("signal", EXCLUDING_SIGNALS)
+def test_a_non_buying_purpose_disqualifies_whatever_the_buyer_status(signal):
+    for buyer in ("no", "ambiguous", "yes"):
+        record = _with_levels(
+            lead(buyer, fit=50, intent=50, total=100, non_buyer_signal=signal),
+            purchasing_readiness="unknown", buying_stage="exploring",
+        )
+        assert recommend(record) == DISQUALIFY, buyer
+
+
+@pytest.mark.parametrize("commitment", [
+    {"purchasing_readiness": "approved", "buying_stage": "exploring"},
+    {"purchasing_readiness": "unknown", "buying_stage": "committed"},
+    {"purchasing_readiness": "approved", "buying_stage": "committed"},
+])
+def test_a_genuine_dual_intent_lead_goes_to_a_human(commitment):
+    """"Budget approved, starting this month - and we'll benchmark your pricing
+    against ours." Two facts that cannot both be acted on automatically."""
+    record = _with_levels(
+        lead("yes", fit=40, intent=45, total=85,
+             non_buyer_signal="competitive_research"),
+        **commitment,
+    )
+    assert recommend(record) == REVIEW
+
+
+def test_dual_intent_needs_the_buyer_status_too():
+    """A lead the model would not even call a buyer is not a dual-intent case,
+    however much commitment language it carries."""
+    for buyer in ("no", "ambiguous"):
+        record = _with_levels(
+            lead(buyer, total=85, non_buyer_signal="competitive_research"),
+            purchasing_readiness="approved", buying_stage="committed",
+        )
+        assert recommend(record) == DISQUALIFY, buyer
+
+
+def test_a_record_without_a_breakdown_still_excludes():
+    """The safe direction when the levels are absent: the stated non-buying
+    purpose stands rather than being softened into a review."""
+    assert recommend(
+        lead("yes", total=100, non_buyer_signal="competitive_research")
+    ) == DISQUALIFY
+
+
+def test_a_genuine_dual_intent_lead_keeps_its_score_suppressed():
     routed = route_lead(
-        {"is_potential_buyer": "yes", "non_buyer_signal": "vendor_pitch",
-         "disqualification_evidence": "we'd like to pitch our platform"},
-        {"company_fit_score": 40, "buying_intent_score": 45, "total_score": 85},
+        {"is_potential_buyer": "yes", "non_buyer_signal": "competitive_research",
+         "disqualification_evidence": "benchmark our own pricing",
+         "purchasing_readiness": {"level": "approved", "evidence": "budget approved"},
+         "buying_stage": {"level": "committed", "evidence": "starting this month"}},
+        {"company_fit_score": 40, "buying_intent_score": 45, "total_score": 85,
+         "breakdown": {"purchasing_readiness": {"level": "approved"},
+                       "buying_stage": {"level": "committed"}}},
         {"lead_id": "L-9"},
     )
     assert routed["recommendation"] == REVIEW
     assert (routed["total_score"], routed["company_fit_score"]) == (None, None)
     assert routed["needs_human_review"] is True
     assert routed["review_reason"] == recommendation.CONTRADICTION_REVIEW_REASON
+
+
+def test_a_plain_competitor_is_disqualified_through_the_whole_router():
+    """End to end through `route_lead`, which is what the pipeline calls."""
+    routed = route_lead(
+        {"is_potential_buyer": "yes", "non_buyer_signal": "competitive_research",
+         "disqualification_evidence": "comparing your pricing for benchmarking"},
+        {"company_fit_score": 50, "buying_intent_score": 6, "total_score": 56,
+         "breakdown": {"purchasing_readiness": {"level": "unknown"},
+                       "buying_stage": {"level": "exploring"}}},
+        {"lead_id": "L-1144"},
+    )
+    assert routed["recommendation"] == DISQUALIFY
+    assert routed["total_score"] == 56, "a disqualified lead keeps its score"
+    assert routed["disqualification_evidence"] == "comparing your pricing for benchmarking"
 
 
 def test_a_genuine_ambiguity_keeps_its_own_reason():
@@ -179,6 +256,15 @@ def test_a_genuine_early_stage_buyer_is_nurtured():
     Every intent factor at its floor, and still a prospect."""
     early = extraction_shape()          # low/low/unknown/none/exploring
     assert route_of(early, fit=28, intent=6) == NURTURE
+
+
+def test_no_budget_and_no_timeline_is_not_grounds_for_disqualifying():
+    """Absence of budget or date says the lead is early, not that it is not a
+    lead. Asserted across the score range so no threshold can reintroduce it."""
+    unready = extraction_shape(purchasing_readiness="unknown", timeline="none",
+                               pain_severity="medium")
+    for fit, intent in ((0, 0), (10, 6), (25, 8), (44, 14), (50, 20)):
+        assert route_of(unready, fit, intent) == NURTURE, (fit, intent)
 
 
 def test_a_genuine_low_intent_buyer_is_nurtured():
@@ -366,14 +452,82 @@ def test_intent_floor_applies_only_to_buyers():
     ],
 )
 def test_total_band_boundaries(total, expected):
-    """The 44/45 and 74/75 edges, asserted exactly."""
-    assert recommend(lead("yes", fit=total - 25, intent=25, total=total)) == expected
+    """The 74/75 edge, asserted exactly. Intent is held at 50 so this varies the
+    total alone - the CONTACT_NOW intent floor is covered separately below."""
+    assert recommend(lead("yes", fit=total - 50, intent=50, total=total)) == expected
+
+
+# --------------------------------------------------------------------------- #
+# The CONTACT_NOW intent floor
+# --------------------------------------------------------------------------- #
+#
+# Contacting today needs a strong lead AND current buying intent. With no target
+# industry set, `industry_fit` pays every lead the full 20 points, so fit sits
+# near its ceiling and 75 alone is reachable on ~27 points of intent - which is
+# what "decision in about a month, budget not locked" scores. Falling short here
+# costs a lead its priority and nothing else.
+
+@pytest.mark.parametrize("intent,expected", [
+    (0, NURTURE), (25, NURTURE), (34, NURTURE),       # below the floor
+    (35, CONTACT_NOW), (36, CONTACT_NOW), (50, CONTACT_NOW),
+])
+def test_contact_now_requires_current_buying_intent(intent, expected):
+    """The 34/35 edge, at a total that clears 75 either way."""
+    assert recommend(lead("yes", fit=50, intent=intent, total=90)) == expected
+
+
+@pytest.mark.parametrize("intent", [0, 25, 34])
+def test_a_lead_short_on_intent_is_nurtured_never_excluded(intent):
+    """It is a genuine prospect that is simply early: NURTURE, and never
+    DISQUALIFY or REVIEW, however high the total."""
+    for total in (75, 90, 100):
+        assert recommend(lead("yes", fit=total - intent, intent=intent,
+                              total=total)) == NURTURE
+
+
+def test_a_high_total_earned_on_fit_alone_does_not_reach_contact_now():
+    """The reported case: fit at its ceiling, intent from medium urgency, high
+    pain, some budget and a decision a month away."""
+    early = lead("yes", fit=50, intent=26, total=76)
+    assert recommend(early) == NURTURE
+
+
+def test_a_strong_lead_still_reaches_contact_now():
+    assert recommend(lead("yes", fit=50, intent=50, total=100)) == CONTACT_NOW
+    assert recommend(lead("yes", fit=25, intent=50, total=75)) == CONTACT_NOW
+
+
+def test_both_conditions_are_required_not_either():
+    # Total clears, intent does not.
+    assert recommend(lead("yes", fit=50, intent=30, total=80)) == NURTURE
+    # Intent clears, total does not.
+    assert recommend(lead("yes", fit=20, intent=50, total=70)) == NURTURE
+    # Both clear.
+    assert recommend(lead("yes", fit=30, intent=50, total=80)) == CONTACT_NOW
+
+
+def test_a_missing_intent_score_does_not_promote_a_lead():
+    """`_score` reads an absent field as 0, so the floor fails closed."""
+    assert recommend({"is_potential_buyer": "yes", "non_buyer_signal": "none",
+                      "total_score": 100}) == NURTURE
+
+
+def test_the_intent_floor_does_not_disturb_disqualify_or_review():
+    """Both gates return before the score is read, so intent cannot reach them."""
+    for intent in (0, 34, 50):
+        assert recommend(lead("no", total=100, intent=intent,
+                              non_buyer_signal="none")) == DISQUALIFY
+        assert recommend(lead("ambiguous", total=100, intent=intent,
+                              non_buyer_signal="none")) == REVIEW
+        assert recommend(lead("no", total=100, intent=intent,
+                              non_buyer_signal="competitive_research")) == DISQUALIFY
 
 
 def test_band_edges_are_inclusive_where_the_document_says_so():
-    assert recommend(lead("yes", fit=20, intent=25, total=45)) == NURTURE       # "45-74"
-    assert recommend(lead("yes", fit=49, intent=25, total=74)) == NURTURE
-    assert recommend(lead("yes", fit=50, intent=25, total=75)) == CONTACT_NOW   # ">= 75"
+    """Intent is held above the CONTACT_NOW floor so this isolates the total."""
+    assert recommend(lead("yes", fit=20, intent=50, total=45)) == NURTURE       # "45-74"
+    assert recommend(lead("yes", fit=24, intent=50, total=74)) == NURTURE
+    assert recommend(lead("yes", fit=25, intent=50, total=75)) == CONTACT_NOW   # ">= 75"
 
 
 def test_every_total_maps_to_exactly_one_route():
